@@ -8,8 +8,8 @@ app.config['SECRET_KEY'] = 'sekret_robotow'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 # Konfiguracja czyszczenia
-INACTIVE_TIMEOUT = 3600  # 1 godzina braku aktywności = usunięcie pokoju
-EMPTY_ROOM_TIMEOUT = 300 # 5 minut pustego pokoju (nikt nie dołączył) = usunięcie
+INACTIVE_TIMEOUT = 172800  # 48h braku aktywności (48 * 3600)
+EMPTY_ROOM_TIMEOUT = 900   # 15 minut pustego pokoju (15 * 60)
 
 # Struktura: { 'ROOM_ID': { ... 'last_active': timestamp } }
 rooms_data = {}
