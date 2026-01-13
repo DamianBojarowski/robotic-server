@@ -20,7 +20,7 @@ rooms_data = {}
 def cleanup_loop():
     """Wątek sprzątający martwe pokoje"""
     while True:
-        socketio.sleep(60) # Sprawdzaj co minutę
+        eventlet.sleep(60) # Sprawdzaj co minutę
         now = time.time()
         to_delete = []
         
