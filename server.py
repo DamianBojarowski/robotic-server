@@ -117,11 +117,44 @@ def on_join_req(data):
     socketio.emit('rooms_list_update', get_public_rooms_list())
 
 @socketio.on('update_progress')
+@socketio.on('update_progress')
 def on_update(data):
     room = data.get('room')
+    user = data.get('username')
+    money = data.get('money', 0)
+    mps = data.get('mps', 0)
+
     if room in rooms_data:
-        rooms_data[room]['last_active'] = time.time() # Każdy update resetuje licznik usunięcia
-        emit('opponent_progress', data, to=room, include_self=False)
+        r_data = rooms_data[room]
+        
+        # Jeśli gra już się skończyła, ignoruj nowe dane
+        if r_data['status'] == 'finished':
+            return
+
+        r_data['last_active'] = time.time()
+        
+        # Aktualizacja danych gracza
+        if user in r_data['players']:
+            r_data['players'][user]['money'] = money
+            r_data['players'][user]['mps'] = mps
+        
+        # --- SPRAWDZANIE WARUNKU ZWYCIĘSTWA ---
+        goal_type = r_data.get('goal_type', 'money')
+        goal_val = r_data.get('goal_value', 1000000)
+        
+        has_won = False
+        if goal_type == 'money' and money >= goal_val:
+            has_won = True
+        elif goal_type == 'mps' and mps >= goal_val: # Jeśli cel to produkcja (np. 'mps')
+            has_won = True
+            
+        if has_won:
+            r_data['status'] = 'finished' # Blokujemy pokój
+            # Wysyłamy sygnał KONIEC GRY do wszystkich w pokoju
+            emit('game_over', {'winner': user}, to=room)
+        else:
+            # Jeśli nikt nie wygrał, ślij update do rywala
+            emit('opponent_progress', data, to=room, include_self=False)
 
 # --- NOWE: Obsługa wyjścia z gry ---
 @socketio.on('leave_game')
