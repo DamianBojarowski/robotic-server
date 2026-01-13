@@ -10,6 +10,11 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = 'sekret_robotow'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
+@app.route('/')
+def index():
+    return "SERVER ROBOTIC EMPIRE DZIAŁA! (To jest backend dla gry)"
+# ----------------------
+
 # Konfiguracja czyszczenia
 INACTIVE_TIMEOUT = 172800  # 48h braku aktywności (48 * 3600)
 EMPTY_ROOM_TIMEOUT = 900   # 15 minut pustego pokoju (15 * 60)
