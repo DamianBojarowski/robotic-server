@@ -1,19 +1,46 @@
 from flask import Flask, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
 import os
+import time
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'sekret_robotow'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
-# Struktura: { 
-#   'ROOM_ID': { 
-#       'password': '...', 
-#       'players': {'Nick': {...}}, 
-#       'status': 'waiting'  <-- NOWE: 'waiting' lub 'playing'
-#   } 
-# }
+# Konfiguracja czyszczenia
+INACTIVE_TIMEOUT = 3600  # 1 godzina braku aktywności = usunięcie pokoju
+EMPTY_ROOM_TIMEOUT = 300 # 5 minut pustego pokoju (nikt nie dołączył) = usunięcie
+
+# Struktura: { 'ROOM_ID': { ... 'last_active': timestamp } }
 rooms_data = {}
+
+def cleanup_loop():
+    """Wątek sprzątający martwe pokoje"""
+    while True:
+        socketio.sleep(60) # Sprawdzaj co minutę
+        now = time.time()
+        to_delete = []
+        
+        for r_id, r_data in rooms_data.items():
+            # 1. Kryterium: Pusty pokój "waiting" wisi za długo
+            if r_data['status'] == 'waiting' and len(r_data['players']) < 2:
+                if now - r_data['last_active'] > EMPTY_ROOM_TIMEOUT:
+                    to_delete.append(r_id)
+                    continue
+
+            # 2. Kryterium: Brak aktywności w grze przez X czasu
+            if now - r_data['last_active'] > INACTIVE_TIMEOUT:
+                to_delete.append(r_id)
+        
+        for r_id in to_delete:
+            print(f"--- CZYSZCZENIE: Usuwanie nieaktywnego pokoju {r_id} ---")
+            del rooms_data[r_id]
+        
+        if to_delete:
+            socketio.emit('rooms_list_update', get_public_rooms_list())
+
+# Uruchomienie tła
+socketio.start_background_task(cleanup_loop)
 
 @socketio.on('connect')
 def on_connect():
@@ -38,17 +65,16 @@ def on_create(data):
         'goal_type': g_type,
         'goal_value': g_val,
         'players': {user: {'money': 0, 'mps': 0}},
-        'status': 'waiting' # Domyślnie czekamy
+        'status': 'waiting',
+        'last_active': time.time() # Znacznik czasu
     }
     
-    # Informujemy twórcę, że wszedł, ale musi czekać
     emit('join_success', {
         'room': room, 
         'goal_desc': f"{g_val} {g_type}",
         'is_new': True,
-        'status': 'waiting' # Flaga dla klienta, żeby zablokował ekran
+        'status': 'waiting'
     })
-    
     socketio.emit('rooms_list_update', get_public_rooms_list())
 
 @socketio.on('join_room_request')
@@ -58,7 +84,7 @@ def on_join_req(data):
     pwd_attempt = data.get('password', '')
     
     if room not in rooms_data:
-        emit('error_log', {'msg': "Pokój nie istnieje!"})
+        emit('error_log', {'msg': "Pokój nie istnieje lub wygasł!"})
         return
     
     r_data = rooms_data[room]
@@ -67,21 +93,18 @@ def on_join_req(data):
         emit('error_log', {'msg': "BŁĘDNE HASŁO!"})
         return
 
-    # Jeśli gra już trwa, a my nie jesteśmy na liście (obserwator) - opcjonalnie blokada
     if len(r_data['players']) >= 2 and user not in r_data['players']:
          emit('error_log', {'msg': "Pokój jest pełny!"})
          return
 
     join_room(room)
     r_data['players'][user] = {'money': 0, 'mps': 0}
+    r_data['last_active'] = time.time() # Odświeżamy aktywność
     
-    # Sprawdzamy stan
     current_status = r_data['status']
     
-    # Jeśli to drugi gracz, uruchamiamy grę!
     if len(r_data['players']) == 2 and current_status == 'waiting':
         r_data['status'] = 'playing'
-        # Wysyłamy sygnał START do wszystkich w pokoju (w tym do tego co czekał)
         socketio.emit('game_start_signal', {'start_time': 0}, to=room)
         current_status = 'playing'
 
@@ -91,13 +114,39 @@ def on_join_req(data):
         'is_new': False,
         'status': current_status
     })
-    
     socketio.emit('rooms_list_update', get_public_rooms_list())
+
+@socketio.on('update_progress')
+def on_update(data):
+    room = data.get('room')
+    if room in rooms_data:
+        rooms_data[room]['last_active'] = time.time() # Każdy update resetuje licznik usunięcia
+        emit('opponent_progress', data, to=room, include_self=False)
+
+# --- NOWE: Obsługa wyjścia z gry ---
+@socketio.on('leave_game')
+def on_leave(data):
+    room = data.get('room')
+    user = data.get('username')
+    
+    if room in rooms_data:
+        if user in rooms_data[room]['players']:
+            # Usuwamy gracza z danych pokoju? 
+            # W PvP 1vs1 lepiej zostawić "miejsce", ale oznaczyć jako wyjście,
+            # albo po prostu powiadomić rywala.
+            # Tutaj: powiadamiamy rywala.
+            emit('player_left', {'username': user}, to=room)
+            
+            # Opcjonalnie: Jeśli pokój jest teraz pusty (oba wyszły), usuń go natychmiast
+            leave_room(room)
+            del rooms_data[room]['players'][user]
+            
+            if len(rooms_data[room]['players']) == 0:
+                del rooms_data[room]
+                socketio.emit('rooms_list_update', get_public_rooms_list())
 
 @socketio.on('disconnect')
 def on_disconnect():
-    # Proste czyszczenie pustych pokoi
-    # W prawdziwej produkcji lepiej użyć session_id do mapowania gracza na pokój
     pass 
 
 @socketio.on('request_rooms_list')
@@ -107,7 +156,6 @@ def on_list_req():
 def get_public_rooms_list():
     public_list = []
     for r_id, r_data in rooms_data.items():
-        # Nie pokazujemy pokoi, które już grają i są pełne
         if r_data['status'] == 'waiting' or len(r_data['players']) < 2:
             public_list.append({
                 'name': r_id,
@@ -116,13 +164,6 @@ def get_public_rooms_list():
                 'locked': bool(r_data['password'])
             })
     return public_list
-
-@socketio.on('update_progress')
-def on_update(data):
-    room = data.get('room')
-    if room in rooms_data:
-        # Rozsyłamy update
-        emit('opponent_progress', data, to=room, include_self=False)
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
