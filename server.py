@@ -157,9 +157,13 @@ def get_public_rooms_list():
     public_list = []
     for r_id, r_data in rooms_data.items():
         if r_data['status'] == 'waiting' or len(r_data['players']) < 2:
+            # Formatowanie celu dla klienta
+            suffix = " PLN" if r_data.get('goal_type') == 'money' else "/s"
+            goal_str = f"{r_data.get('goal_value', 0)}{suffix}"
+            
             public_list.append({
                 'name': r_id,
-                'goal': f"{r_data['goal_value']}",
+                'goal': goal_str, # Teraz klient dostanie np. "50000/s"
                 'players': len(r_data['players']),
                 'locked': bool(r_data['password'])
             })
