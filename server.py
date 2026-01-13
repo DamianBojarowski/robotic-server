@@ -142,11 +142,14 @@ def on_update(data):
         goal_type = r_data.get('goal_type', 'money')
         goal_val = r_data.get('goal_value', 1000000)
         
+        # Jeśli gra jest bez limitu (-1), nigdy nie ustawiamy has_won na True
         has_won = False
-        if goal_type == 'money' and money >= goal_val:
-            has_won = True
-        elif goal_type == 'mps' and mps >= goal_val: # Jeśli cel to produkcja (np. 'mps')
-            has_won = True
+        
+        if goal_val != -1: # <--- TYLKO JEŚLI JEST CEL
+            if goal_type == 'money' and money >= goal_val:
+                has_won = True
+            elif goal_type == 'mps' and mps >= goal_val:
+                has_won = True
             
         if has_won:
             r_data['status'] = 'finished' # Blokujemy pokój
@@ -190,13 +193,18 @@ def get_public_rooms_list():
     public_list = []
     for r_id, r_data in rooms_data.items():
         if r_data['status'] == 'waiting' or len(r_data['players']) < 2:
-            # Formatowanie celu dla klienta
-            suffix = " PLN" if r_data.get('goal_type') == 'money' else "/s"
-            goal_str = f"{r_data.get('goal_value', 0)}{suffix}"
+            
+            # Formatowanie celu
+            g_val = r_data.get('goal_value', 0)
+            if g_val == -1:
+                goal_str = "BEZ LIMITU"
+            else:
+                suffix = " PLN" if r_data.get('goal_type') == 'money' else "/s"
+                goal_str = f"{g_val}{suffix}"
             
             public_list.append({
                 'name': r_id,
-                'goal': goal_str, # Teraz klient dostanie np. "50000/s"
+                'goal': goal_str,
                 'players': len(r_data['players']),
                 'locked': bool(r_data['password'])
             })
