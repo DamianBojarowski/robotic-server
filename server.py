@@ -83,44 +83,42 @@ def on_connect(auth=None):
 
 @socketio.on('create_room')
 def on_create(data):
-    rooms_col = get_db()  # Używamy bezpiecznego połączenia
+    rooms_col = get_db()
     
-    # Pobieramy i czyścimy dane
     room = data.get('room', '').strip()
     raw_user = data.get('username', '').strip()
-    user_key = raw_user.lower() # Klucz do bazy (małe litery)
+    user_key = raw_user.lower()
     
-    pwd = data.get('password', '')
-    g_type = data.get('goal_type', 'money')
-    g_val = data.get('goal_value', 1000000)
+    # --- FIREWALL: Blokada domyślnego nicku ---
+    if user_key == "gracz":
+        emit('error_log', {'msg': "Niedozwolony nick! Zmień 'Gracz' na coś innego."})
+        return
+    # ------------------------------------------
 
-    # --- WALIDACJA ---
-    if not room:
-        emit('error_log', {'msg': "Nazwa pokoju nie może być pusta!"})
+    if not room or not raw_user:
+        emit('error_log', {'msg': "Dane nie mogą być puste!"})
         return
-    if not raw_user:
-        emit('error_log', {'msg': "Nick nie może być pusty!"})
-        return
-    
-    # Sprawdzenie czy pokój już istnieje
+
+    # --- FIREWALL: Blokada nadpisywania ---
+    # Jeśli pokój istnieje, NIE WOLNO nic w nim zmieniać przez create_room
     if rooms_col.find_one({"_id": room}):
-        emit('error_log', {'msg': f"Pokój '{room}' już istnieje!"})
+        emit('error_log', {'msg': f"Pokój '{room}' już istnieje! Użyj opcji DOŁĄCZ."})
         return
+    # --------------------------------------
 
-    # Dołączenie do pokoju w SocketIO
     join_room(room)
     
-    # Tworzymy dokument pokoju (Struktura zgodna z on_join_req)
+    # Tworzymy NOWY, CZYSTY pokój
     room_doc = {
         "_id": room,
-        "password": pwd,
-        "goal_type": g_type,
-        "goal_value": g_val,
+        "password": data.get('password', ''),
+        "goal_type": data.get('goal_type', 'money'),
+        "goal_value": data.get('goal_value', 1000000),
         "players": {
             user_key: { 
-                'money': 0, 
-                'mps': 0,
-                'display_name': raw_user # Ważne dla wyświetlania
+                'money': 0.0, 
+                'mps': 0.0,
+                'display_name': raw_user # Tu musi być display_name!
             }
         },
         "player_count": 1,
@@ -130,17 +128,14 @@ def on_create(data):
     
     rooms_col.insert_one(room_doc)
     
-    # Wysyłka sukcesu
     emit('join_success', {
         'room': room, 
-        'goal_desc': f"{g_val} {g_type}",
+        'goal_desc': f"{data.get('goal_value')} {data.get('goal_type')}",
         'is_new': True,
         'status': 'waiting',
         'saved_money': 0,
         'saved_mps': 0
     })
-    
-    # Aktualizacja listy pokoi dla wszystkich
     socketio.emit('rooms_list_update', get_public_rooms_list())
 
 @socketio.on('join_room_request')
@@ -152,17 +147,14 @@ def on_join_req(data):
     user_key = raw_user.lower()
     pwd_attempt = data.get('password', '')
 
-    # --- ZABEZPIECZENIE 1: Walidacja i Blokada "Gracza" ---
-    if not raw_user:
-        emit('error_log', {'msg': "Nick nie może być pusty!"})
-        return
-    
-    # Blokujemy domyślny nick z Kivy, żeby uniknąć pomyłek
+    # --- FIREWALL: Blokada domyślnego nicku ---
     if user_key == "gracz":
-        emit('error_log', {'msg': "Zmień nick! 'Gracz' jest niedozwolony."})
+        emit('error_log', {'msg': "Zmień nick! 'Gracz' jest zablokowany."})
+        return
+    if not raw_user:
+        emit('error_log', {'msg': "Nick pusty!"})
         return
 
-    # 1. Pobieramy stan pokoju
     r_data = rooms_col.find_one({"_id": room})
     if not r_data:
         emit('error_log', {'msg': "Pokój nie istnieje!"})
@@ -170,65 +162,58 @@ def on_join_req(data):
 
     players = r_data.get('players', {})
     
-    # --- ZABEZPIECZENIE 2: AUTO-CZYSZCZENIE (THE CLEANER) ---
-    # Jeśli w bazie jest syf (więcej niż 2 graczy), usuwamy nadmiarowych
-    # Zostawiamy tylko obecnego (jeśli tam był) i jednego rywala.
+    # --- CLEANER: Usuwanie pasażerów na gapę ---
+    # Jeśli w bazie jest > 2 graczy, usuwamy wszystkich oprócz nas (jeśli tam jesteśmy) i jednego innego.
     if len(players) > 2:
-        print(f"--- [CLEANER] Wykryto tłok w pokoju {room}. Czyszczenie... ---")
-        # Sortujemy graczy (żeby usuwanie było przewidywalne - np. alfabetycznie)
-        all_keys = sorted(list(players.keys()))
+        print(f"--- [CLEANER] Naprawiam pokój {room} (za dużo graczy) ---")
+        valid_players = {}
         
-        # Jeśli ja tu jestem, zostawiam siebie. Jeśli nie, zostawiam pierwszych 2.
-        # To prosty mechanizm ratunkowy.
-        keys_to_keep = [k for k in all_keys if k == user_key]
-        for k in all_keys:
-            if len(keys_to_keep) < 2 and k != user_key:
-                keys_to_keep.append(k)
+        # 1. Jeśli JA już tam byłem, zachowuję siebie
+        if user_key in players:
+            valid_players[user_key] = players[user_key]
+            
+        # 2. Dobieramy resztę do limitu 2
+        for k, v in players.items():
+            if len(valid_players) < 2 and k != user_key:
+                valid_players[k] = v
         
-        # Nadpisujemy słownik players w bazie tylko dozwolonymi kluczami
-        new_players = {k: players[k] for k in keys_to_keep}
-        rooms_col.update_one({"_id": room}, {"$set": {"players": new_players}})
-        
-        # Odświeżamy zmienną lokalną
-        players = new_players
+        # Nadpisujemy bazę wersją naprawioną
+        rooms_col.update_one({"_id": room}, {"$set": {"players": valid_players}})
+        players = valid_players # Aktualizujemy zmienną lokalną
+    # -------------------------------------------
 
-    # 3. Sprawdzenie slotów po czyszczeniu
     is_already_registered = user_key in players
+
     if not is_already_registered and len(players) >= 2:
-        emit('error_log', {'msg': "POKÓJ PEŁNY! (Zajęty przez innych)"})
+        emit('error_log', {'msg': "POKÓJ PEŁNY!"})
         return
 
-    # 4. Hasło
     if r_data.get('password') and r_data['password'] != pwd_attempt:
         emit('error_log', {'msg': "BŁĘDNE HASŁO!"})
         return
 
     join_room(room)
 
-    # 5. Aktualizacja (Teraz bezpieczna)
+    # Aktualizacja bazy
     if not is_already_registered:
         rooms_col.update_one(
             {"_id": room},
             {
-                "$set": {
-                    f"players.{user_key}": {
-                        'money': 0.0, 'mps': 0.0, 'display_name': raw_user
-                    },
-                    "last_active": time.time()
-                }
+                "$set": {f"players.{user_key}": {'money': 0.0, 'mps': 0.0, 'display_name': raw_user}},
+                "$set": {"last_active": time.time()}
             }
         )
-        # Naprawiamy licznik przy okazji
+        # Fix licznika
         rooms_col.update_one({"_id": room}, {"$set": {"player_count": len(players) + 1}})
     else:
         rooms_col.update_one({"_id": room}, {"$set": {"last_active": time.time()}})
 
-    # 6. Świeże dane
+    # Pobranie po update
     r_data_fresh = rooms_col.find_one({"_id": room})
     fresh_players = r_data_fresh.get('players', {})
     my_stats = fresh_players.get(user_key, {'money': 0, 'mps': 0})
 
-    # 7. Wymuszony start
+    # START
     current_status = r_data_fresh.get('status', 'waiting')
     if len(fresh_players) >= 2:
         if current_status == 'waiting':
@@ -237,7 +222,6 @@ def on_join_req(data):
         
         socketio.emit('game_start_signal', {'msg': 'START'}, to=room)
 
-    # 8. Sukces
     emit('join_success', {
         'room': room,
         'goal_desc': f"{r_data.get('goal_value')} {r_data.get('goal_type')}",
@@ -247,7 +231,6 @@ def on_join_req(data):
         'saved_mps': my_stats.get('mps', 0)
     })
 
-    # 9. Sync rywala
     for p_id, p_stats in fresh_players.items():
         if p_id != user_key:
             emit('opponent_progress', {
