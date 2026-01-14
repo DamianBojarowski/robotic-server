@@ -6,4 +6,4 @@ eventlet==0.33.3
 gunicorn==21.2.0
 Werkzeug==2.2.3
 pymongo[srv]
-dnspython
+dnspython==1.16.0
