@@ -136,46 +136,55 @@ def on_join_req(data):
         emit('error_log', {'msg': "BŁĘDNE HASŁO!"})
         return
 
-    players = r_data['players']
+    players = r_data.get('players', {})
     
+    # Sprawdzenie pełnego pokoju (tylko dla nowych graczy)
     if len(players) >= 2 and user not in players:
          emit('error_log', {'msg': "Pokój jest pełny!"})
          return
 
     join_room(room)
     
-    # Aktualizacja gracza w bazie
-    update_fields = {
-        f"players.{user}": {'money': 0, 'mps': 0},
-        "last_active": time.time()
+    # --- FIX: INTELIGENTNA AKTUALIZACJA ---
+    # Jeśli gracz już jest w bazie -> Zaktualizuj tylko czas (NIE RESETUJ KASY!)
+    # Jeśli gracza nie ma -> Dodaj go z wartościami 0
+    
+    update_ops = {
+        "$set": {"last_active": time.time()}
     }
     
-    # Logika startu gry
+    if user not in players:
+        # Nowy gracz: Inicjalizacja i zwiększenie licznika
+        update_ops["$set"][f"players.{user}"] = {'money': 0, 'mps': 0}
+        update_ops["$set"]["player_count"] = len(players) + 1
+        is_returning = False
+    else:
+        # Powracający gracz: Nic nie zmieniamy w statystykach, tylko czas
+        # Licznik graczy też zostaje bez zmian (bo już tam byłeś)
+        is_returning = True
+    
+    # Wykonaj update w bazie
+    rooms_collection.update_one({"_id": room}, update_ops)
+    
+    # --- LOGIKA STARTU GRY ---
     current_status = r_data['status']
-    # Jeśli to drugi gracz i gra czekała -> START
-    if len(players) < 2 and user not in players and current_status == 'waiting':
-        update_fields["status"] = "playing"
+    
+    # Jeśli to drugi gracz (nowy) i gra czekała -> START
+    # (Warunek: nie byłeś w graczach wcześniej ORAZ teraz jest 2 graczy łącznie)
+    if not is_returning and len(players) == 1 and current_status == 'waiting':
+        rooms_collection.update_one({"_id": room}, {"$set": {"status": "playing"}})
         current_status = "playing"
         socketio.emit('game_start_signal', {'start_time': 0}, to=room)
         
-        # --- FIX: WYŚLIJ NOWEMU GRACZOWI DANE RYWALA (Z BAZY) ---
-        # Stary gracz (host) jest już w 'players' pobranym z bazy
+        # Wyślij nowemu graczowi dane hosta (który już tam jest)
         for p_name, p_stats in players.items():
-            if p_name != user:
-                emit('opponent_progress', {
-                    'username': p_name,
-                    'money': p_stats.get('money', 0),
-                    'mps': p_stats.get('mps', 0)
-                })
-        # --------------------------------------------------------
+            emit('opponent_progress', {
+                'username': p_name,
+                'money': p_stats.get('money', 0),
+                'mps': p_stats.get('mps', 0)
+            })
 
-    # Zapisz zmiany w bazie
-    # Obliczamy nową liczbę graczy (jeśli user był nowy, to +1, jeśli wraca, to bez zmian)
-    new_count = len(players) + (1 if user not in players else 0)
-    update_fields["player_count"] = new_count
-    
-    rooms_collection.update_one({"_id": room}, {"$set": update_fields})
-
+    # --- WYSYŁANIE STATUSU DO DOŁĄCZAJĄCEGO ---
     emit('join_success', {
         'room': room,
         'goal_desc': f"{r_data['goal_value']} {r_data['goal_type']}",
@@ -183,10 +192,12 @@ def on_join_req(data):
         'status': current_status
     })
     
-    # Jeśli wracasz do gry, pobierz od razu dane rywala (jeśli tam jest)
+    # --- POBIERANIE DANYCH RYWALA (DLA POWRACAJĄCYCH I NOWYCH) ---
     # Pobieramy świeże dane po update
     r_data_fresh = rooms_collection.find_one({"_id": room})
-    for p_name, p_stats in r_data_fresh['players'].items():
+    fresh_players = r_data_fresh.get('players', {})
+    
+    for p_name, p_stats in fresh_players.items():
         if p_name != user:
             emit('opponent_progress', {
                 'username': p_name,
