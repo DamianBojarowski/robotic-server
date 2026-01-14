@@ -120,7 +120,8 @@ def on_create(data):
 @socketio.on('join_room_request')
 def on_join_req(data):
     room = data['room']
-    user = data['username']
+    # .strip() usuwa przypadkowe spacje, które psują porównywanie nicków
+    user = data['username'].strip() 
     pwd_attempt = data.get('password', '')
     
     if rooms_collection is None: return
@@ -138,72 +139,72 @@ def on_join_req(data):
 
     players = r_data.get('players', {})
     
-    # Sprawdzenie pełnego pokoju (tylko dla nowych graczy)
+    # Sprawdzenie pełnego pokoju (tylko jeśli gracza nie ma jeszcze na liście)
     if len(players) >= 2 and user not in players:
          emit('error_log', {'msg': "Pokój jest pełny!"})
          return
 
     join_room(room)
     
-    # --- FIX: INTELIGENTNA AKTUALIZACJA ---
-    # Jeśli gracz już jest w bazie -> Zaktualizuj tylko czas (NIE RESETUJ KASY!)
-    # Jeśli gracza nie ma -> Dodaj go z wartościami 0
-    
+    # --- FIX 1: INTELIGENTNA AKTUALIZACJA (BEZ RESETU) ---
     update_ops = {
         "$set": {"last_active": time.time()}
     }
     
+    is_returning = False
     if user not in players:
-        # Nowy gracz: Inicjalizacja i zwiększenie licznika
+        # Nowy gracz: Dopiero teraz inicjalizujemy go zerami
         update_ops["$set"][f"players.{user}"] = {'money': 0, 'mps': 0}
+        # Zwiększamy licznik tylko przy nowym graczu
         update_ops["$set"]["player_count"] = len(players) + 1
-        is_returning = False
     else:
-        # Powracający gracz: Nic nie zmieniamy w statystykach, tylko czas
-        # Licznik graczy też zostaje bez zmian (bo już tam byłeś)
+        # Gracz powracający: NIE RUSZAMY JEGO PIENIĘDZY W BAZIE!
         is_returning = True
     
     # Wykonaj update w bazie
     rooms_collection.update_one({"_id": room}, update_ops)
     
-    # --- LOGIKA STARTU GRY ---
+    # --- FIX 2: LOGIKA STARTU I WYSYŁANIA DANYCH ---
     current_status = r_data['status']
     
     # Jeśli to drugi gracz (nowy) i gra czekała -> START
-    # (Warunek: nie byłeś w graczach wcześniej ORAZ teraz jest 2 graczy łącznie)
     if not is_returning and len(players) == 1 and current_status == 'waiting':
         rooms_collection.update_one({"_id": room}, {"$set": {"status": "playing"}})
         current_status = "playing"
         socketio.emit('game_start_signal', {'start_time': 0}, to=room)
-        
-        # Wyślij nowemu graczowi dane hosta (który już tam jest)
-        for p_name, p_stats in players.items():
+
+    # Wyślij status do gracza
+    emit('join_success', {
+        'room': room,
+        'goal_desc': f"{r_data['goal_value']} {r_data['goal_type']}",
+        'is_new': not is_returning,
+        'status': current_status
+    })
+    
+    # --- FIX 3: POBIERANIE DANYCH RYWALA ---
+    # Pobieramy świeże dane z bazy (już po update)
+    r_data_fresh = rooms_collection.find_one({"_id": room})
+    fresh_players = r_data_fresh.get('players', {})
+    
+    found_opponent = False
+    for p_name, p_stats in fresh_players.items():
+        # Porównujemy nicki po wyczyszczeniu spacji
+        if p_name.strip() != user:
+            found_opponent = True
             emit('opponent_progress', {
                 'username': p_name,
                 'money': p_stats.get('money', 0),
                 'mps': p_stats.get('mps', 0)
             })
 
-    # --- WYSYŁANIE STATUSU DO DOŁĄCZAJĄCEGO ---
-    emit('join_success', {
-        'room': room,
-        'goal_desc': f"{r_data['goal_value']} {r_data['goal_type']}",
-        'is_new': False,
-        'status': current_status
-    })
-    
-    # --- POBIERANIE DANYCH RYWALA (DLA POWRACAJĄCYCH I NOWYCH) ---
-    # Pobieramy świeże dane po update
-    r_data_fresh = rooms_collection.find_one({"_id": room})
-    fresh_players = r_data_fresh.get('players', {})
-    
-    for p_name, p_stats in fresh_players.items():
-        if p_name != user:
-            emit('opponent_progress', {
-                'username': p_name,
-                'money': p_stats.get('money', 0),
-                'mps': p_stats.get('mps', 0)
-            })
+    # Jeśli nie znaleziono rywala w bazie (bo np. został usunięty starym kodem),
+    # wysyłamy pusty status, żeby wyczyścić ewentualne śmieci w UI
+    if not found_opponent:
+         emit('opponent_progress', {
+            'username': 'Oczekiwanie...',
+            'money': 0,
+            'mps': 0
+        })
 
     socketio.emit('rooms_list_update', get_public_rooms_list())
 
