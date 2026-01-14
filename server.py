@@ -258,20 +258,23 @@ def on_leave(data):
     emit('player_left', {'username': user}, to=room)
     leave_room(room)
     
-    # Usuń gracza z bazy
-    # Używamy $unset do usunięcia klucza ze słownika graczy
+    # --- POPRAWKA: NIE KASUJEMY DANYCH ($unset usunięte) ---
+    # Jedynie aktualizujemy czas aktywności, żeby room nie wygasł od razu.
+    # Dzięki temu dane zostają w bazie (persistent save).
+    
     rooms_collection.update_one(
         {"_id": room},
         {
-            "$unset": {f"players.{user}": ""},
-            "$inc": {"player_count": -1} # Zmniejsz licznik
+            "$set": {"last_active": time.time()},
+            # Opcjonalnie: Możemy zmniejszyć licznik aktywnych graczy,
+            # ale dla logiki "save'a" ważniejsza jest lista 'players'.
+            # Jeśli Twoja logika opiera się na 'len(players)', to nie ruszamy tego.
         }
     )
     
-    # Sprawdź czy pokój jest pusty
-    r_data = rooms_collection.find_one({"_id": room})
-    if r_data and r_data['player_count'] <= 0:
-        rooms_collection.delete_one({"_id": room})
+    # UWAGA: Usuwamy fragment sprawdzania czy pokój jest pusty i kasowania go natychmiast.
+    # Niech cleanup_loop (pętla czyszcząca) zajmie się usuwaniem starych pokoi po 48h.
+    # Dzięki temu, jak obaj wyjdziecie, pokój nadal istnieje w bazie.
         
     socketio.emit('rooms_list_update', get_public_rooms_list())
 
