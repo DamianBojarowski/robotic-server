@@ -172,10 +172,16 @@ def on_join_req(data):
     # ------------------------------------------
 
     current_status = r_data_fresh.get('status', 'waiting')
+    # 2. Sprawdzamy realną liczbę osób w słowniku (to jest źródło prawdy)
     if len(fresh_players) >= 2:
-        if current_status == 'waiting':
+        # 3. Jeśli jest komplet, a baza mówi, że wciąż czekamy...
+        if r_data_fresh.get('status') == 'waiting':
+            # ...to wymuszamy zmianę na "playing"
             rooms_collection.update_one({"_id": room}, {"$set": {"status": "playing"}})
-            current_status = "playing"
+            print(f"--- [FIX] Naprawiono status pokoju {room} na 'playing' ---")
+        
+        # 4. ZAWSZE wysyłamy sygnał startu do obu okien. 
+        # Dzięki temu okno "Oczekiwanie" zniknie u obu graczy.
         socketio.emit('game_start_signal', {'msg': 'START'}, to=room)
 
     emit('join_success', {
