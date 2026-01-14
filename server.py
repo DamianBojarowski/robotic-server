@@ -46,7 +46,9 @@ def cleanup_loop():
     """Wątek sprzątający martwe pokoje z BAZY"""
     while True:
         eventlet.sleep(60)
-        if not rooms_collection: continue
+        # STARE: if not rooms_collection: continue
+        # NOWE:
+        if rooms_collection is None: continue 
         
         now = time.time()
         
@@ -69,7 +71,9 @@ def cleanup_loop():
 socketio.start_background_task(cleanup_loop)
 
 @socketio.on('connect')
-def on_connect():
+# STARE: def on_connect():
+# NOWE (dodaj argument):
+def on_connect(auth=None):
     emit('rooms_list_update', get_public_rooms_list())
 
 @socketio.on('create_room')
@@ -80,7 +84,7 @@ def on_create(data):
     g_type = data.get('goal_type', 'money')
     g_val = data.get('goal_value', 1000000)
     
-    if not rooms_collection: return
+    if rooms_collection is None: return
 
     # Sprawdź w bazie czy pokój istnieje
     if rooms_collection.find_one({"_id": room}):
@@ -119,7 +123,7 @@ def on_join_req(data):
     user = data['username']
     pwd_attempt = data.get('password', '')
     
-    if not rooms_collection: return
+    if rooms_collection is None: return
     
     # Pobierz pokój z bazy
     r_data = rooms_collection.find_one({"_id": room})
@@ -276,7 +280,7 @@ def on_list_req():
     emit('rooms_list_update', get_public_rooms_list())
 
 def get_public_rooms_list():
-    if not rooms_collection: return []
+    if rooms_collection is None: return []
     
     # Pobierz tylko pokoje "waiting" lub gdzie jest < 2 graczy
     # Pobieramy z bazy
