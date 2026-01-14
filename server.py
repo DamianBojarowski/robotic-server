@@ -118,11 +118,17 @@ def on_create(data):
     socketio.emit('rooms_list_update', get_public_rooms_list())
 
 @socketio.on('join_room_request')
+@socketio.on('join_room_request')
 def on_join_req(data):
     room = data['room']
     raw_user = data['username'].strip()
-    user_key = raw_user.lower()  # Klucz w bazie zawsze małymi literami
+    user_key = raw_user.lower()
     pwd_attempt = data.get('password', '')
+
+    # --- FIX: Blokada pustych nicków ---
+    if not raw_user or user_key == "":
+        emit('error_log', {'msg': "NICK NIE MOŻE BYĆ PUSTY!"})
+        return
 
     if rooms_collection is None: return
     r_data = rooms_collection.find_one({"_id": room})
@@ -132,11 +138,11 @@ def on_join_req(data):
         return
 
     players = r_data.get('players', {}) 
-    
-    # Sprawdzamy, czy sloty są zajęte (porównujemy klucze lowercase)
     is_already_registered = user_key in players
+
+    # --- FIX: Logika blokady slotów ---
     if not is_already_registered and len(players) >= 2:
-        emit('error_log', {'msg': "POKÓJ PEŁNY!"})
+        emit('error_log', {'msg': "POKÓJ JEST JUŻ PEŁNY I ZABLOKOWANY!"})
         return
 
     if r_data['password'] and r_data['password'] != pwd_attempt:
@@ -145,7 +151,7 @@ def on_join_req(data):
 
     join_room(room)
 
-    # Aktualizacja bazy (używamy user_key jako stałego identyfikatora)
+    # Aktualizacja danych w MongoDB
     if not is_already_registered:
         rooms_collection.update_one(
             {"_id": room}, 
@@ -155,38 +161,43 @@ def on_join_req(data):
                 "$set": {"last_active": time.time()}
             }
         )
+    else:
+        rooms_collection.update_one({"_id": room}, {"$set": {"last_active": time.time()}})
     
-    # Pobieramy świeże dane
+    # Pobieramy świeży stan po update
     r_data_fresh = rooms_collection.find_one({"_id": room})
     fresh_players = r_data_fresh.get('players', {})
     my_stats = fresh_players.get(user_key)
 
-    # 1. Wysyłamy sukces do nas
+    # --- FIX: Logika startu i odblokowania okna czekania ---
+    # Jeśli w bazie jest już 2 graczy, wymuszamy status 'playing'
+    current_room_status = r_data_fresh.get('status', 'waiting')
+    if len(fresh_players) >= 2:
+        if current_room_status == 'waiting':
+            rooms_collection.update_one({"_id": room}, {"$set": {"status": "playing"}})
+            current_room_status = "playing"
+        
+        # Sygnał START dla obu okien (żeby zamknąć okno "Oczekiwanie")
+        socketio.emit('game_start_signal', {'msg': 'START'}, to=room)
+
+    # Wysyłamy sukces do dołączającego
     emit('join_success', {
         'room': room,
         'goal_desc': f"{r_data['goal_value']} {r_data['goal_type']}",
         'is_new': not is_already_registered,
-        'status': 'playing' if len(fresh_players) >= 2 else 'waiting',
+        'status': current_room_status,
         'saved_money': my_stats.get('money', 0),
         'saved_mps': my_stats.get('mps', 0)
     })
     
-    # 2. SYNC RYWALA (Wysyłamy do gracza tylko dane przeciwnika)
+    # Przesyłamy statystyki rywala
     for p_id, p_stats in fresh_players.items():
-        if p_id != user_key:  # Jeśli to nie ja, to jest to rywal
-            # Wyślij dane rywala do MNIE
+        if p_id != user_key:
             emit('opponent_progress', {
                 'username': p_stats.get('display_name', p_id),
                 'money': p_stats.get('money', 0),
                 'mps': p_stats.get('mps', 0)
             })
-            
-    # 3. Poinformuj rywala, że JA wszedłem (jeśli jest online)
-    emit('opponent_progress', {
-        'username': raw_user,
-        'money': my_stats.get('money', 0),
-        'mps': my_stats.get('mps', 0)
-    }, room=room, include_self=False)
 
 @socketio.on('update_progress')
 def on_update(data):
