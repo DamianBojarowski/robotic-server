@@ -83,43 +83,64 @@ def on_connect(auth=None):
 
 @socketio.on('create_room')
 def on_create(data):
-    room = data['room']
-    user = data['username']
+    rooms_col = get_db()  # Używamy bezpiecznego połączenia
+    
+    # Pobieramy i czyścimy dane
+    room = data.get('room', '').strip()
+    raw_user = data.get('username', '').strip()
+    user_key = raw_user.lower() # Klucz do bazy (małe litery)
+    
     pwd = data.get('password', '')
     g_type = data.get('goal_type', 'money')
     g_val = data.get('goal_value', 1000000)
-    
-    if rooms_collection is None: return
 
-    # Sprawdź w bazie czy pokój istnieje
-    if rooms_collection.find_one({"_id": room}):
-        emit('error_log', {'msg': f"Pokój {room} już istnieje!"})
+    # --- WALIDACJA ---
+    if not room:
+        emit('error_log', {'msg': "Nazwa pokoju nie może być pusta!"})
+        return
+    if not raw_user:
+        emit('error_log', {'msg': "Nick nie może być pusty!"})
+        return
+    
+    # Sprawdzenie czy pokój już istnieje
+    if rooms_col.find_one({"_id": room}):
+        emit('error_log', {'msg': f"Pokój '{room}' już istnieje!"})
         return
 
+    # Dołączenie do pokoju w SocketIO
     join_room(room)
     
-    # Tworzymy dokument pokoju
+    # Tworzymy dokument pokoju (Struktura zgodna z on_join_req)
     room_doc = {
-        "_id": room, # ID pokoju to jego nazwa
+        "_id": room,
         "password": pwd,
         "goal_type": g_type,
         "goal_value": g_val,
         "players": {
-            user: {'money': 0, 'mps': 0}
+            user_key: { 
+                'money': 0, 
+                'mps': 0,
+                'display_name': raw_user # Ważne dla wyświetlania
+            }
         },
         "player_count": 1,
         "status": "waiting",
         "last_active": time.time()
     }
     
-    rooms_collection.insert_one(room_doc)
+    rooms_col.insert_one(room_doc)
     
+    # Wysyłka sukcesu
     emit('join_success', {
         'room': room, 
         'goal_desc': f"{g_val} {g_type}",
         'is_new': True,
-        'status': 'waiting'
+        'status': 'waiting',
+        'saved_money': 0,
+        'saved_mps': 0
     })
+    
+    # Aktualizacja listy pokoi dla wszystkich
     socketio.emit('rooms_list_update', get_public_rooms_list())
 
 @socketio.on('join_room_request')
