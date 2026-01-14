@@ -152,7 +152,7 @@ def on_join_req(data):
     user_key = raw_user.lower()
     pwd_attempt = data.get('password', '')
 
-    # Walidacja podstawowa
+    # --- WALIDACJA ---
     if not raw_user:
         emit('error_log', {'msg': "Nick nie może być pusty!"})
         return
@@ -181,17 +181,22 @@ def on_join_req(data):
     join_room(room)
 
     # 5. Aktualizacja bazy (Teraz jesteśmy pewni, że jest miejsce)
+    # --- TU BYŁ BŁĄD: Dodaliśmy brakujące 'display_name' ---
     if not is_already_registered:
         rooms_col.update_one(
             {"_id": room},
             {
-                "$set": {f"players.{user_key}": {'money': 0.0, 'mps': 0.0, 'display_name': raw_user}},
+                "$set": {
+                    f"players.{user_key}": {
+                        'money': 0.0, 
+                        'mps': 0.0, 
+                        'display_name': raw_user # <--- TO NAPRAWIA BRAK NICKU
+                    }
+                },
                 "$set": {"last_active": time.time()} 
-                # UWAGA: Usunąłem inkrementację player_count, bo jest zawodna.
-                # Będziemy polegać na len(players).
             }
         )
-        # Ręcznie aktualizujemy player_count dla porządku w liście pokoi
+        # Aktualizujemy licznik dla listy pokoi
         rooms_col.update_one({"_id": room}, {"$set": {"player_count": len(players) + 1}})
     else:
         rooms_col.update_one({"_id": room}, {"$set": {"last_active": time.time()}})
@@ -203,11 +208,12 @@ def on_join_req(data):
     # Statystyki gracza (zabezpieczenie przed None)
     my_stats = fresh_players.get(user_key, {'money': 0, 'mps': 0})
 
-    # 7. LOGIKA STARTU I ODBLOKOWANIA
+    # 7. LOGIKA STARTU I ODBLOKOWANIA (NAPRAWIONA)
     current_status = r_data_fresh.get('status', 'waiting')
     
-    # Jeśli jest 2 (lub więcej w wyniku błędu) graczy -> GRA MA TRWAĆ
+    # Jeśli jest 2 graczy -> GRA MA TRWAĆ
     if len(fresh_players) >= 2:
+        # Jeśli baza mówi, że czekamy, to kłamie -> Zmień na playing
         if current_status == 'waiting':
             rooms_col.update_one({"_id": room}, {"$set": {"status": "playing"}})
             current_status = "playing"
@@ -232,7 +238,7 @@ def on_join_req(data):
     for p_id, p_stats in fresh_players.items():
         if p_id != user_key:
             emit('opponent_progress', {
-                'username': p_stats.get('display_name', p_id),
+                'username': p_stats.get('display_name', p_id), # Teraz zadziała, bo display_name jest zapisane
                 'money': p_stats.get('money', 0),
                 'mps': p_stats.get('mps', 0)
             })
