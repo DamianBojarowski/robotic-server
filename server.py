@@ -14,23 +14,28 @@ import os
 import time
 from pymongo import MongoClient # Importujemy klienta bazy
 
+# ... (importy i MutableMapping fix bez zmian) ...
+
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'sekret_robotow'
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', ping_timeout=25, ping_interval=10)
 
-# --- KONFIGURACJA BAZY DANYCH ---
-# Wklej tu swój link, pamiętaj o haśle!
-# Najlepiej trzymać to w zmiennych środowiskowych na Renderze, ale do testów wpisz tu:
+# --- NOWA KONFIGURACJA BAZY (Lazy Loading) ---
 MONGO_URI = "mongodb+srv://admin:bojar55555@cluster0.kugbsd0.mongodb.net/?appName=Cluster0"
+db_client = None
+rooms_collection = None
 
-try:
-    client = MongoClient(MONGO_URI)
-    db = client.robotic_game  # Nazwa bazy
-    rooms_collection = db.rooms # Nazwa kolekcji (tabeli)
-    print("--- POŁĄCZONO Z BAZĄ MONGODB ---")
-except Exception as e:
-    print(f"--- BŁĄD BAZY DANYCH: {e} ---")
-    rooms_collection = None
+def get_db():
+    global db_client, rooms_collection
+    if db_client is None:
+        # Połączenie nawiązywane jest dopiero wewnątrz workera
+        db_client = MongoClient(MONGO_URI)
+        db = db_client.robotic_game
+        rooms_collection = db.rooms
+        print("--- [WORKER] POŁĄCZONO Z BAZĄ MONGODB ---")
+    return rooms_collection
+
+# W cleanup_loop i innych miejscach używaj get_db() zamiast rooms_collection
 
 # --------------------------------
 
