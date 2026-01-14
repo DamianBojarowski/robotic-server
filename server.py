@@ -120,9 +120,8 @@ def on_create(data):
 @socketio.on('join_room_request')
 def on_join_req(data):
     room = data['room']
-    # Normalizujemy nick do małych liter dla bazy danych
     raw_user = data['username'].strip()
-    user = raw_user.lower() 
+    user_key = raw_user.lower()  # Klucz w bazie zawsze małymi literami
     pwd_attempt = data.get('password', '')
 
     if rooms_collection is None: return
@@ -133,43 +132,36 @@ def on_join_req(data):
         return
 
     players = r_data.get('players', {}) 
-    is_already_registered = user in players
-    registered_count = len(players)
-
-    if not is_already_registered and registered_count >= 2:
-        emit('error_log', {'msg': "Ten pokój jest już zajęty!"})
-        return
     
+    # Sprawdzamy, czy sloty są zajęte (porównujemy klucze lowercase)
+    is_already_registered = user_key in players
+    if not is_already_registered and len(players) >= 2:
+        emit('error_log', {'msg': "POKÓJ PEŁNY!"})
+        return
+
     if r_data['password'] and r_data['password'] != pwd_attempt:
         emit('error_log', {'msg': "BŁĘDNE HASŁO!"})
         return
 
     join_room(room)
 
-    # Zapisujemy w bazie używając małych liter jako klucza
+    # Aktualizacja bazy (używamy user_key jako stałego identyfikatora)
     if not is_already_registered:
         rooms_collection.update_one(
             {"_id": room}, 
             {
-                "$set": {f"players.{user}": {'money': 0, 'mps': 0, 'display_name': raw_user}, "last_active": time.time()},
-                "$inc": {"player_count": 1} 
+                "$set": {f"players.{user_key}": {'money': 0, 'mps': 0, 'display_name': raw_user}},
+                "$inc": {"player_count": 1},
+                "$set": {"last_active": time.time()}
             }
         )
-    else:
-        rooms_collection.update_one({"_id": room}, {"$set": {"last_active": time.time()}})
     
+    # Pobieramy świeże dane
     r_data_fresh = rooms_collection.find_one({"_id": room})
     fresh_players = r_data_fresh.get('players', {})
-    my_stats = fresh_players.get(user, {'money': 0, 'mps': 0})
+    my_stats = fresh_players.get(user_key)
 
-    # Sygnał startu
-    if len(fresh_players) >= 2:
-        if r_data_fresh.get('status') == "waiting":
-            rooms_collection.update_one({"_id": room}, {"$set": {"status": "playing"}})
-        def delayed_start():
-            socketio.emit('game_start_signal', {'msg': 'START'}, to=room)
-        eventlet.spawn_after(0.5, delayed_start)
-
+    # 1. Wysyłamy sukces do nas
     emit('join_success', {
         'room': room,
         'goal_desc': f"{r_data['goal_value']} {r_data['goal_type']}",
@@ -179,15 +171,22 @@ def on_join_req(data):
         'saved_mps': my_stats.get('mps', 0)
     })
     
-    # SYNC RYWALA (Używamy małych liter do porównania)
+    # 2. SYNC RYWALA (Wysyłamy do gracza tylko dane przeciwnika)
     for p_id, p_stats in fresh_players.items():
-        if p_id != user: # Porównanie małych liter
-            # Wysyłamy dane rywala do mnie
+        if p_id != user_key:  # Jeśli to nie ja, to jest to rywal
+            # Wyślij dane rywala do MNIE
             emit('opponent_progress', {
                 'username': p_stats.get('display_name', p_id),
                 'money': p_stats.get('money', 0),
                 'mps': p_stats.get('mps', 0)
             })
+            
+    # 3. Poinformuj rywala, że JA wszedłem (jeśli jest online)
+    emit('opponent_progress', {
+        'username': raw_user,
+        'money': my_stats.get('money', 0),
+        'mps': my_stats.get('mps', 0)
+    }, room=room, include_self=False)
 
 @socketio.on('update_progress')
 def on_update(data):
