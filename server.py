@@ -5,49 +5,60 @@ from flask import Flask, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
 import os
 import time
+from pymongo import MongoClient # Importujemy klienta bazy
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'sekret_robotow'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
-@app.route('/')
-def index():
-    return "SERVER ROBOTIC EMPIRE DZIAŁA! (To jest backend dla gry)"
-# ----------------------
+# --- KONFIGURACJA BAZY DANYCH ---
+# Wklej tu swój link, pamiętaj o haśle!
+# Najlepiej trzymać to w zmiennych środowiskowych na Renderze, ale do testów wpisz tu:
+MONGO_URI = "mongodb+srv://TWOJ_LOGIN:TWOJE_HASLO@cluster....mongodb.net/?retryWrites=true&w=majority"
+
+try:
+    client = MongoClient(MONGO_URI)
+    db = client.robotic_game  # Nazwa bazy
+    rooms_collection = db.rooms # Nazwa kolekcji (tabeli)
+    print("--- POŁĄCZONO Z BAZĄ MONGODB ---")
+except Exception as e:
+    print(f"--- BŁĄD BAZY DANYCH: {e} ---")
+    rooms_collection = None
+
+# --------------------------------
 
 # Konfiguracja czyszczenia
-INACTIVE_TIMEOUT = 172800  # 48h braku aktywności (48 * 3600)
-EMPTY_ROOM_TIMEOUT = 900   # 15 minut pustego pokoju (15 * 60)
+INACTIVE_TIMEOUT = 172800  # 48h
+EMPTY_ROOM_TIMEOUT = 900   # 15 min
 
-# Struktura: { 'ROOM_ID': { ... 'last_active': timestamp } }
-rooms_data = {}
+@app.route('/')
+def index():
+    return "SERVER ROBOTIC EMPIRE DZIAŁA! (MongoDB Connected)"
 
 def cleanup_loop():
-    """Wątek sprzątający martwe pokoje"""
+    """Wątek sprzątający martwe pokoje z BAZY"""
     while True:
-        eventlet.sleep(60) # Sprawdzaj co minutę
+        eventlet.sleep(60)
+        if not rooms_collection: continue
+        
         now = time.time()
-        to_delete = []
         
-        for r_id, r_data in rooms_data.items():
-            # 1. Kryterium: Pusty pokój "waiting" wisi za długo
-            if r_data['status'] == 'waiting' and len(r_data['players']) < 2:
-                if now - r_data['last_active'] > EMPTY_ROOM_TIMEOUT:
-                    to_delete.append(r_id)
-                    continue
+        # Usuń stare pokoje z bazy
+        # Kryterium 1: waiting i puste > 15 min
+        rooms_collection.delete_many({
+            "status": "waiting",
+            "last_active": {"$lt": now - EMPTY_ROOM_TIMEOUT},
+            "player_count": {"$lt": 2} # Musimy to śledzić
+        })
+        
+        # Kryterium 2: nieaktywne > 48h
+        rooms_collection.delete_many({
+            "last_active": {"$lt": now - INACTIVE_TIMEOUT}
+        })
+        
+        # Odśwież listę dla graczy
+        socketio.emit('rooms_list_update', get_public_rooms_list())
 
-            # 2. Kryterium: Brak aktywności w grze przez X czasu
-            if now - r_data['last_active'] > INACTIVE_TIMEOUT:
-                to_delete.append(r_id)
-        
-        for r_id in to_delete:
-            print(f"--- CZYSZCZENIE: Usuwanie nieaktywnego pokoju {r_id} ---")
-            del rooms_data[r_id]
-        
-        if to_delete:
-            socketio.emit('rooms_list_update', get_public_rooms_list())
-
-# Uruchomienie tła
 socketio.start_background_task(cleanup_loop)
 
 @socketio.on('connect')
@@ -62,20 +73,30 @@ def on_create(data):
     g_type = data.get('goal_type', 'money')
     g_val = data.get('goal_value', 1000000)
     
-    if room in rooms_data:
+    if not rooms_collection: return
+
+    # Sprawdź w bazie czy pokój istnieje
+    if rooms_collection.find_one({"_id": room}):
         emit('error_log', {'msg': f"Pokój {room} już istnieje!"})
         return
 
     join_room(room)
     
-    rooms_data[room] = {
-        'password': pwd,
-        'goal_type': g_type,
-        'goal_value': g_val,
-        'players': {user: {'money': 0, 'mps': 0}},
-        'status': 'waiting',
-        'last_active': time.time() # Znacznik czasu
+    # Tworzymy dokument pokoju
+    room_doc = {
+        "_id": room, # ID pokoju to jego nazwa
+        "password": pwd,
+        "goal_type": g_type,
+        "goal_value": g_val,
+        "players": {
+            user: {'money': 0, 'mps': 0}
+        },
+        "player_count": 1,
+        "status": "waiting",
+        "last_active": time.time()
     }
+    
+    rooms_collection.insert_one(room_doc)
     
     emit('join_success', {
         'room': room, 
@@ -91,30 +112,58 @@ def on_join_req(data):
     user = data['username']
     pwd_attempt = data.get('password', '')
     
-    if room not in rooms_data:
+    if not rooms_collection: return
+    
+    # Pobierz pokój z bazy
+    r_data = rooms_collection.find_one({"_id": room})
+    
+    if not r_data:
         emit('error_log', {'msg': "Pokój nie istnieje lub wygasł!"})
         return
-    
-    r_data = rooms_data[room]
     
     if r_data['password'] and r_data['password'] != pwd_attempt:
         emit('error_log', {'msg': "BŁĘDNE HASŁO!"})
         return
 
-    if len(r_data['players']) >= 2 and user not in r_data['players']:
+    players = r_data['players']
+    
+    if len(players) >= 2 and user not in players:
          emit('error_log', {'msg': "Pokój jest pełny!"})
          return
 
     join_room(room)
-    r_data['players'][user] = {'money': 0, 'mps': 0}
-    r_data['last_active'] = time.time() # Odświeżamy aktywność
     
+    # Aktualizacja gracza w bazie
+    update_fields = {
+        f"players.{user}": {'money': 0, 'mps': 0},
+        "last_active": time.time()
+    }
+    
+    # Logika startu gry
     current_status = r_data['status']
-    
-    if len(r_data['players']) == 2 and current_status == 'waiting':
-        r_data['status'] = 'playing'
+    # Jeśli to drugi gracz i gra czekała -> START
+    if len(players) < 2 and user not in players and current_status == 'waiting':
+        update_fields["status"] = "playing"
+        current_status = "playing"
         socketio.emit('game_start_signal', {'start_time': 0}, to=room)
-        current_status = 'playing'
+        
+        # --- FIX: WYŚLIJ NOWEMU GRACZOWI DANE RYWALA (Z BAZY) ---
+        # Stary gracz (host) jest już w 'players' pobranym z bazy
+        for p_name, p_stats in players.items():
+            if p_name != user:
+                emit('opponent_progress', {
+                    'username': p_name,
+                    'money': p_stats.get('money', 0),
+                    'mps': p_stats.get('mps', 0)
+                })
+        # --------------------------------------------------------
+
+    # Zapisz zmiany w bazie
+    # Obliczamy nową liczbę graczy (jeśli user był nowy, to +1, jeśli wraca, to bez zmian)
+    new_count = len(players) + (1 if user not in players else 0)
+    update_fields["player_count"] = new_count
+    
+    rooms_collection.update_one({"_id": room}, {"$set": update_fields})
 
     emit('join_success', {
         'room': room,
@@ -122,9 +171,20 @@ def on_join_req(data):
         'is_new': False,
         'status': current_status
     })
+    
+    # Jeśli wracasz do gry, pobierz od razu dane rywala (jeśli tam jest)
+    # Pobieramy świeże dane po update
+    r_data_fresh = rooms_collection.find_one({"_id": room})
+    for p_name, p_stats in r_data_fresh['players'].items():
+        if p_name != user:
+            emit('opponent_progress', {
+                'username': p_name,
+                'money': p_stats.get('money', 0),
+                'mps': p_stats.get('mps', 0)
+            })
+
     socketio.emit('rooms_list_update', get_public_rooms_list())
 
-@socketio.on('update_progress')
 @socketio.on('update_progress')
 def on_update(data):
     room = data.get('room')
@@ -132,90 +192,109 @@ def on_update(data):
     money = data.get('money', 0)
     mps = data.get('mps', 0)
 
-    if room in rooms_data:
-        r_data = rooms_data[room]
-        
-        # Jeśli gra już się skończyła, ignoruj nowe dane
-        if r_data['status'] == 'finished':
-            return
+    if not rooms_collection: return
 
-        r_data['last_active'] = time.time()
-        
-        # Aktualizacja danych gracza
-        if user in r_data['players']:
-            r_data['players'][user]['money'] = money
-            r_data['players'][user]['mps'] = mps
-        
-        # --- SPRAWDZANIE WARUNKU ZWYCIĘSTWA ---
-        goal_type = r_data.get('goal_type', 'money')
-        goal_val = r_data.get('goal_value', 1000000)
-        
-        # Jeśli gra jest bez limitu (-1), nigdy nie ustawiamy has_won na True
+    # Optymalizacja: Nie pobieramy całego dokumentu przy każdym update (za wolno)
+    # Po prostu wysyłamy update do bazy i do rywala
+    
+    # 1. Wyślij do rywala (Szybko, przez RAM)
+    emit('opponent_progress', data, to=room, include_self=False)
+    
+    # 2. Zapisz w bazie (Async w tle? Nie, tu zrobimy prosto)
+    # Żeby nie zatykać bazy, można by to robić rzadziej, ale na start OK.
+    
+    # Sprawdzamy wygraną TYLKO jeśli trzeba (pobranie celu)
+    # Żeby nie czytać bazy co ułamek sekundy, zróbmy tak:
+    # Czytamy cel tylko raz na jakiś czas?
+    # Albo: Zakładamy, że klient wie co robi.
+    # Ale dla bezpieczeństwa sprawdźmy w bazie.
+    
+    r_data = rooms_collection.find_one({"_id": room}, {"status": 1, "goal_type": 1, "goal_value": 1})
+    
+    if not r_data: return
+    if r_data['status'] == 'finished': return
+
+    # Zapisz postęp
+    rooms_collection.update_one(
+        {"_id": room},
+        {"$set": {
+            f"players.{user}.money": money,
+            f"players.{user}.mps": mps,
+            "last_active": time.time()
+        }}
+    )
+    
+    # Warunek zwycięstwa
+    goal_val = r_data.get('goal_value', 1000000)
+    if goal_val != -1:
         has_won = False
+        goal_type = r_data.get('goal_type', 'money')
         
-        if goal_val != -1: # <--- TYLKO JEŚLI JEST CEL
-            if goal_type == 'money' and money >= goal_val:
-                has_won = True
-            elif goal_type == 'mps' and mps >= goal_val:
-                has_won = True
-            
+        if goal_type == 'money' and money >= goal_val: has_won = True
+        elif goal_type == 'mps' and mps >= goal_val: has_won = True
+        
         if has_won:
-            r_data['status'] = 'finished' # Blokujemy pokój
-            # Wysyłamy sygnał KONIEC GRY do wszystkich w pokoju
+            rooms_collection.update_one({"_id": room}, {"$set": {"status": "finished"}})
             emit('game_over', {'winner': user}, to=room)
-        else:
-            # Jeśli nikt nie wygrał, ślij update do rywala
-            emit('opponent_progress', data, to=room, include_self=False)
 
-# --- NOWE: Obsługa wyjścia z gry ---
 @socketio.on('leave_game')
 def on_leave(data):
     room = data.get('room')
     user = data.get('username')
     
-    if room in rooms_data:
-        if user in rooms_data[room]['players']:
-            # Usuwamy gracza z danych pokoju? 
-            # W PvP 1vs1 lepiej zostawić "miejsce", ale oznaczyć jako wyjście,
-            # albo po prostu powiadomić rywala.
-            # Tutaj: powiadamiamy rywala.
-            emit('player_left', {'username': user}, to=room)
-            
-            # Opcjonalnie: Jeśli pokój jest teraz pusty (oba wyszły), usuń go natychmiast
-            leave_room(room)
-            del rooms_data[room]['players'][user]
-            
-            if len(rooms_data[room]['players']) == 0:
-                del rooms_data[room]
-                socketio.emit('rooms_list_update', get_public_rooms_list())
+    if not rooms_collection: return
 
-@socketio.on('disconnect')
-def on_disconnect():
-    pass 
+    emit('player_left', {'username': user}, to=room)
+    leave_room(room)
+    
+    # Usuń gracza z bazy
+    # Używamy $unset do usunięcia klucza ze słownika graczy
+    rooms_collection.update_one(
+        {"_id": room},
+        {
+            "$unset": {f"players.{user}": ""},
+            "$inc": {"player_count": -1} # Zmniejsz licznik
+        }
+    )
+    
+    # Sprawdź czy pokój jest pusty
+    r_data = rooms_collection.find_one({"_id": room})
+    if r_data and r_data['player_count'] <= 0:
+        rooms_collection.delete_one({"_id": room})
+        
+    socketio.emit('rooms_list_update', get_public_rooms_list())
 
 @socketio.on('request_rooms_list')
 def on_list_req():
     emit('rooms_list_update', get_public_rooms_list())
 
 def get_public_rooms_list():
+    if not rooms_collection: return []
+    
+    # Pobierz tylko pokoje "waiting" lub gdzie jest < 2 graczy
+    # Pobieramy z bazy
+    cursor = rooms_collection.find({
+        "$or": [
+            {"status": "waiting"},
+            {"player_count": {"$lt": 2}}
+        ]
+    })
+    
     public_list = []
-    for r_id, r_data in rooms_data.items():
-        if r_data['status'] == 'waiting' or len(r_data['players']) < 2:
+    for r_data in cursor:
+        g_val = r_data.get('goal_value', 0)
+        if g_val == -1:
+            goal_str = "BEZ LIMITU"
+        else:
+            suffix = " PLN" if r_data.get('goal_type') == 'money' else "/s"
+            goal_str = f"{g_val}{suffix}"
             
-            # Formatowanie celu
-            g_val = r_data.get('goal_value', 0)
-            if g_val == -1:
-                goal_str = "BEZ LIMITU"
-            else:
-                suffix = " PLN" if r_data.get('goal_type') == 'money' else "/s"
-                goal_str = f"{g_val}{suffix}"
-            
-            public_list.append({
-                'name': r_id,
-                'goal': goal_str,
-                'players': len(r_data['players']),
-                'locked': bool(r_data['password'])
-            })
+        public_list.append({
+            'name': r_data['_id'],
+            'goal': goal_str,
+            'players': r_data.get('player_count', 0),
+            'locked': bool(r_data.get('password'))
+        })
     return public_list
 
 if __name__ == '__main__':
