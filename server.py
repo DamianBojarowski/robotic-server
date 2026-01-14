@@ -124,19 +124,19 @@ def on_create(data):
 
 @socketio.on('join_room_request')
 def on_join_req(data):
+    rooms_col = get_db()  # Pobieramy kolekcję przez funkcję get_db
+    
     room = data.get('room')
     raw_user = data.get('username', '').strip()
     user_key = raw_user.lower()
     pwd_attempt = data.get('password', '')
 
     if not raw_user or user_key == "":
-        emit('error_log', {'msg': "BŁĄD: Nick nie może być pusty!"})
+        emit('error_log', {'msg': "Nick nie może być pusty!"})
         return
 
-    if rooms_collection is None: return
-
-    # 1. Pobieramy dane pokoju
-    r_data = rooms_collection.find_one({"_id": room})
+    # 1. Pobieramy pokój
+    r_data = rooms_col.find_one({"_id": room})
     if not r_data:
         emit('error_log', {'msg': "Pokój nie istnieje!"})
         return
@@ -144,12 +144,12 @@ def on_join_req(data):
     players = r_data.get('players', {})
     is_already_registered = user_key in players
 
-    # 2. Sprawdzenie slotów (używamy realnej długości słownika players)
+    # 2. Sprawdzamy sloty (na podstawie realnej listy w players)
     if not is_already_registered and len(players) >= 2:
         emit('error_log', {'msg': "POKÓJ PEŁNY!"})
         return
 
-    # 3. Sprawdzenie hasła
+    # 3. Hasło
     if r_data.get('password') and r_data['password'] != pwd_attempt:
         emit('error_log', {'msg': "BŁĘDNE HASŁO!"})
         return
@@ -157,37 +157,44 @@ def on_join_req(data):
     # 4. Dołączenie do SocketIO
     join_room(room)
 
-    # 5. Aktualizacja bazy danych
+    # 5. Aktualizacja bazy (Persistence)
     if not is_already_registered:
-        rooms_collection.update_one(
+        rooms_col.update_one(
             {"_id": room},
             {
-                "$set": {f"players.{user_key}": {'money': 0, 'mps': 0, 'display_name': raw_user}},
+                "$set": {f"players.{user_key}": {'money': 0.0, 'mps': 0.0, 'display_name': raw_user}},
                 "$inc": {"player_count": 1},
                 "$set": {"last_active": time.time()}
             }
         )
     else:
-        rooms_collection.update_one({"_id": room}, {"$set": {"last_active": time.time()}})
+        rooms_col.update_one({"_id": room}, {"$set": {"last_active": time.time()}})
 
-    # 6. Pobranie ŚWIEŻYCH danych po aktualizacji (to eliminuje błąd NoneType)
-    r_data_fresh = rooms_collection.find_one({"_id": room})
+    # 6. POBIERANIE DANYCH (Zabezpieczenie przed Race Condition)
+    r_data_fresh = rooms_col.find_one({"_id": room})
     fresh_players = r_data_fresh.get('players', {})
     
-    # Failsafe: jeśli bazy nie ma, tworzymy pusty obiekt, żeby .get() nie wywalił błędu
-    my_stats = fresh_players.get(user_key, {'money': 0, 'mps': 0})
+    # --- FIX DLA NoneType ---
+    # Jeśli find_one nie nadążył za update_one, tworzymy statystyki w locie
+    my_stats = fresh_players.get(user_key)
+    if my_stats is None:
+        print(f"--- [WARNING] Baza opóźniona dla {user_key}, używam wartości domyślnych ---")
+        my_stats = {'money': 0.0, 'mps': 0.0}
+    # ------------------------
 
-    # 7. LOGIKA STARTU (Naprawia pokoje utknięte w 'waiting')
+    # 7. LOGIKA STARTU (Naprawa pokoi utkniętych w 'waiting')
     current_status = r_data_fresh.get('status', 'waiting')
     if len(fresh_players) >= 2:
         if current_status == 'waiting':
-            rooms_collection.update_one({"_id": room}, {"$set": {"status": "playing"}})
+            rooms_col.update_one({"_id": room}, {"$set": {"status": "playing"}})
             current_status = "playing"
         
-        # Wysyłamy sygnał START (to zamknie okno czekania u obu graczy)
-        socketio.emit('game_start_signal', {'msg': 'START'}, to=room)
+        # ZAWSZE wysyłamy sygnał START, gdy jest komplet (odblokowuje okno czekania)
+        def send_start():
+            socketio.emit('game_start_signal', {'msg': 'START'}, to=room)
+        eventlet.spawn_after(0.2, send_start)
 
-    # 8. Wysyłka sukcesu do klienta
+    # 8. Wysyłka do klienta
     emit('join_success', {
         'room': room,
         'goal_desc': f"{r_data.get('goal_value')} {r_data.get('goal_type')}",
@@ -197,7 +204,7 @@ def on_join_req(data):
         'saved_mps': my_stats.get('mps', 0)
     })
 
-    # 9. Przesłanie danych rywala (tylko jeśli to nie JA)
+    # 9. Dane przeciwnika
     for p_id, p_stats in fresh_players.items():
         if p_id != user_key:
             emit('opponent_progress', {
