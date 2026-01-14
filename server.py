@@ -14,7 +14,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 # --- KONFIGURACJA BAZY DANYCH ---
 # Wklej tu swój link, pamiętaj o haśle!
 # Najlepiej trzymać to w zmiennych środowiskowych na Renderze, ale do testów wpisz tu:
-MONGO_URI = "mongodb+srv://admin:bojar55555@cluster....mongodb.net/?retryWrites=true&w=majority"
+MONGO_URI = "mongodb+srv://admin:bojar55555@cluster0.kugbsd0.mongodb.net/?appName=Cluster0"
 
 try:
     client = MongoClient(MONGO_URI)
