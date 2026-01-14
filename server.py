@@ -120,93 +120,82 @@ def on_create(data):
 @socketio.on('join_room_request')
 def on_join_req(data):
     room = data['room']
-    # .strip() usuwa przypadkowe spacje, które psują porównywanie nicków
-    user = data['username'].strip() 
+    user = data['username'].strip()
     pwd_attempt = data.get('password', '')
-    
+
     if rooms_collection is None: return
     
-    # Pobierz pokój z bazy
+    # 1. NAJPIERW pobierz dane pokoju
     r_data = rooms_collection.find_one({"_id": room})
     
     if not r_data:
         emit('error_log', {'msg': "Pokój nie istnieje lub wygasł!"})
         return
+
+    players = r_data.get('players', {})  # Słownik {nick: dane}
     
+    # 2. Logika blokady (tylko 2 pierwsze osoby, które kiedykolwiek weszły)
+    is_already_registered = user in players
+    registered_count = len(players)
+
+    if not is_already_registered:
+        if registered_count >= 2:
+            emit('error_log', {'msg': "POKÓJ PEŁNY: Zarezerwowany dla innych graczy!"})
+            return
+        print(f"--- [AUTH] Gracz {user} zajmuje slot w pokoju {room} ---")
+    else:
+        print(f"--- [AUTH] Powrót stałego gracza: {user} ---")
+
+    # 3. Sprawdzenie hasła
     if r_data['password'] and r_data['password'] != pwd_attempt:
         emit('error_log', {'msg': "BŁĘDNE HASŁO!"})
         return
 
-    players = r_data.get('players', {})
-    
-    # Sprawdzenie pełnego pokoju (tylko jeśli gracza nie ma jeszcze na liście)
-    if len(players) >= 2 and user not in players:
-         emit('error_log', {'msg': "Pokój jest pełny!"})
-         return
-
+    # 4. Dołączenie do komunikacji live
     join_room(room)
-    
-    # --- FIX 1: INTELIGENTNA AKTUALIZACJA (BEZ RESETU) ---
-    update_ops = {
-        "$set": {"last_active": time.time()}
-    }
-    
-    is_returning = False
-    if user not in players:
-        # Nowy gracz: Dopiero teraz inicjalizujemy go zerami
-        update_ops["$set"][f"players.{user}"] = {'money': 0, 'mps': 0}
-        # Zwiększamy licznik tylko przy nowym graczu
-        update_ops["$set"]["player_count"] = len(players) + 1
-    else:
-        # Gracz powracający: NIE RUSZAMY JEGO PIENIĘDZY W BAZIE!
-        is_returning = True
-    
-    # Wykonaj update w bazie
-    rooms_collection.update_one({"_id": room}, update_ops)
-    
-    # --- FIX 2: LOGIKA STARTU I WYSYŁANIA DANYCH ---
-    current_status = r_data['status']
-    
-    # Jeśli to drugi gracz (nowy) i gra czekała -> START
-    if not is_returning and len(players) == 1 and current_status == 'waiting':
-        rooms_collection.update_one({"_id": room}, {"$set": {"status": "playing"}})
-        current_status = "playing"
-        socketio.emit('game_start_signal', {'start_time': 0}, to=room)
 
-    # Wyślij status do gracza
+    # 5. Aktualizacja bazy (tylko jeśli to zupełnie nowy gracz)
+    if not is_already_registered:
+        rooms_collection.update_one(
+            {"_id": room},
+            {
+                "$set": {f"players.{user}": {'money': 0, 'mps': 0}, "last_active": time.time()},
+                "$inc": {"player_count": 1}
+            }
+        )
+    
+    # 6. POBIERANIE ŚWIEŻYCH DANYCH (Cloud Save + Dane Rywala)
+    # Pobieramy dokument ponownie, żeby mieć pewność co do stanu po update
+    r_data_fresh = rooms_collection.find_one({"_id": room})
+    fresh_players = r_data_fresh.get('players', {})
+    my_stats = fresh_players.get(user, {'money': 0, 'mps': 0})
+
+    # 7. Wysyłka sukcesu do gracza (z danymi z bazy)
     emit('join_success', {
         'room': room,
         'goal_desc': f"{r_data['goal_value']} {r_data['goal_type']}",
-        'is_new': not is_returning,
-        'status': current_status
+        'is_new': not is_already_registered,
+        'status': 'playing' if len(fresh_players) >= 2 else 'waiting',
+        'saved_money': my_stats.get('money', 0),
+        'saved_mps': my_stats.get('mps', 0)
     })
-    
-    # --- FIX 3: POBIERANIE DANYCH RYWALA ---
-    # Pobieramy świeże dane z bazy (już po update)
-    r_data_fresh = rooms_collection.find_one({"_id": room})
-    fresh_players = r_data_fresh.get('players', {})
-    
-    found_opponent = False
+
+    # 8. SYNC RYWALA (Ominięcie efektu lustra)
+    my_clean_name = user.strip().lower()
     for p_name, p_stats in fresh_players.items():
-        # Porównujemy nicki po wyczyszczeniu spacji
-        if p_name.strip() != user:
-            found_opponent = True
+        if p_name.strip().lower() != my_clean_name:
+            # Wysyłamy dane rywala do gracza, który właśnie wszedł
             emit('opponent_progress', {
                 'username': p_name,
                 'money': p_stats.get('money', 0),
                 'mps': p_stats.get('mps', 0)
             })
-
-    # Jeśli nie znaleziono rywala w bazie (bo np. został usunięty starym kodem),
-    # wysyłamy pusty status, żeby wyczyścić ewentualne śmieci w UI
-    if not found_opponent:
-         emit('opponent_progress', {
-            'username': 'Oczekiwanie...',
-            'money': 0,
-            'mps': 0
-        })
-
-    socketio.emit('rooms_list_update', get_public_rooms_list())
+            # Informujemy rywala (jeśli jest online), że my wróciliśmy
+            emit('opponent_progress', {
+                'username': user,
+                'money': my_stats.get('money', 0),
+                'mps': my_stats.get('mps', 0)
+            }, to=room, include_self=False)
 
 @socketio.on('update_progress')
 def on_update(data):
@@ -267,29 +256,17 @@ def on_leave(data):
     
     if rooms_collection is None: return
 
+    # --- POPRAWKA 3: PERSYSTENCJA (NIE KASUJEMY) ---
+    # Informujemy rywala, że wyszliśmy, ale dane zostają w MongoDB
     emit('player_left', {'username': user}, to=room)
     leave_room(room)
     
-    # --- POPRAWKA: NIE KASUJEMY DANYCH ($unset usunięte) ---
-    # Jedynie aktualizujemy czas aktywności, żeby room nie wygasł od razu.
-    # Dzięki temu dane zostają w bazie (persistent save).
+    # Aktualizujemy tylko czas, żeby cleanup_loop wiedział, że ktoś tu jeszcze "żyje"
+    rooms_collection.update_one({"_id": room}, {"$set": {"last_active": time.time()}})
     
-    rooms_collection.update_one(
-        {"_id": room},
-        {
-            "$set": {"last_active": time.time()},
-            # Opcjonalnie: Możemy zmniejszyć licznik aktywnych graczy,
-            # ale dla logiki "save'a" ważniejsza jest lista 'players'.
-            # Jeśli Twoja logika opiera się na 'len(players)', to nie ruszamy tego.
-        }
-    )
-    
-    # UWAGA: Usuwamy fragment sprawdzania czy pokój jest pusty i kasowania go natychmiast.
-    # Niech cleanup_loop (pętla czyszcząca) zajmie się usuwaniem starych pokoi po 48h.
-    # Dzięki temu, jak obaj wyjdziecie, pokój nadal istnieje w bazie.
-        
+    print(f"--- [LEAVE] Gracz {user} wyszedł, ale slot w {room} pozostaje zarezerwowany ---")
     socketio.emit('rooms_list_update', get_public_rooms_list())
-
+    
 @socketio.on('request_rooms_list')
 def on_list_req():
     emit('rooms_list_update', get_public_rooms_list())
