@@ -145,100 +145,94 @@ def on_create(data):
 
 @socketio.on('join_room_request')
 def on_join_req(data):
-    rooms_col = get_db()  # Używamy bezpiecznego połączenia
+    rooms_col = get_db()
     
     room = data.get('room')
     raw_user = data.get('username', '').strip()
-    user_key = raw_user.lower()
+    user_key = raw_user.lower() # Klucz to zawsze małe litery
     pwd_attempt = data.get('password', '')
 
-    # --- WALIDACJA ---
     if not raw_user:
         emit('error_log', {'msg': "Nick nie może być pusty!"})
         return
 
-    # 1. Pobieramy stan pokoju
+    # 1. POBRANIE STANU AKTUALNEGO
     r_data = rooms_col.find_one({"_id": room})
     if not r_data:
         emit('error_log', {'msg': "Pokój nie istnieje!"})
         return
 
     players = r_data.get('players', {})
-    is_already_registered = user_key in players
     
-    # 2. BEZWZGLĘDNA BLOKADA SLOTÓW
-    # Jeśli gracza nie ma na liście, a lista ma już 2 lub więcej wpisów -> STOP
-    if not is_already_registered and len(players) >= 2:
-        emit('error_log', {'msg': "POKÓJ PEŁNY! Nie możesz dołączyć."})
+    # 2. SPRAWDZENIE DOSTĘPU (BRAMKARZ)
+    is_returning_player = user_key in players
+    current_count = len(players)
+
+    # Jeżeli to nie jest powracający gracz, a miejsc brak -> Blokujemy
+    if not is_returning_player and current_count >= 2:
+        emit('error_log', {'msg': "POKÓJ PEŁNY (2/2)!"})
         return
 
-    # 3. Sprawdzenie hasła
+    # 3. SPRAWDZENIE HASŁA
     if r_data.get('password') and r_data['password'] != pwd_attempt:
         emit('error_log', {'msg': "BŁĘDNE HASŁO!"})
         return
 
-    # 4. Dołączenie do SocketIO
     join_room(room)
 
-    # 5. Aktualizacja bazy (Teraz jesteśmy pewni, że jest miejsce)
-    # --- TU BYŁ BŁĄD: Dodaliśmy brakujące 'display_name' ---
-    if not is_already_registered:
-        rooms_col.update_one(
-            {"_id": room},
-            {
-                "$set": {
-                    f"players.{user_key}": {
-                        'money': 0.0, 
-                        'mps': 0.0, 
-                        'display_name': raw_user # <--- TO NAPRAWIA BRAK NICKU
-                    }
-                },
-                "$set": {"last_active": time.time()} 
-            }
-        )
-        # Aktualizujemy licznik dla listy pokoi
-        rooms_col.update_one({"_id": room}, {"$set": {"player_count": len(players) + 1}})
-    else:
-        rooms_col.update_one({"_id": room}, {"$set": {"last_active": time.time()}})
+    # 4. AKTUALIZACJA DANYCH W BAZIE
+    # Niezależnie czy nowy, czy stary - aktualizujemy 'last_active' i zapewniamy poprawność danych
+    update_query = {
+        "$set": {
+            "last_active": time.time(),
+            # Upewniamy się, że ten gracz ma poprawne dane w bazie
+            f"players.{user_key}.display_name": raw_user 
+        }
+    }
+    
+    # Jeśli to nowy gracz, inicjujemy mu pieniądze (jeśli stary, nie ruszamy kasy!)
+    if not is_returning_player:
+        update_query["$set"][f"players.{user_key}.money"] = 0.0
+        update_query["$set"][f"players.{user_key}.mps"] = 0.0
+        # Ręcznie zwiększamy licznik, żeby lista pokoi widziała zmianę
+        update_query["$inc"] = {"player_count": 1}
 
-    # 6. Pobranie stanu PO aktualizacji
+    rooms_col.update_one({"_id": room}, update_query)
+
+    # 5. ODNOWIENIE DANYCH PO ZAPISIE (Dla logiki startu)
     r_data_fresh = rooms_col.find_one({"_id": room})
     fresh_players = r_data_fresh.get('players', {})
-    
-    # Statystyki gracza (zabezpieczenie przed None)
     my_stats = fresh_players.get(user_key, {'money': 0, 'mps': 0})
-
-    # 7. LOGIKA STARTU I ODBLOKOWANIA (NAPRAWIONA)
+    
+    # 6. LOGIKA STARTU GRY
+    # Jeśli mamy 2 lub więcej graczy w bazie -> GRA TRWA
     current_status = r_data_fresh.get('status', 'waiting')
     
-    # Jeśli jest 2 graczy -> GRA MA TRWAĆ
     if len(fresh_players) >= 2:
-        # Jeśli baza mówi, że czekamy, to kłamie -> Zmień na playing
+        # Jeśli status był 'waiting', zmieniamy na 'playing'
         if current_status == 'waiting':
             rooms_col.update_one({"_id": room}, {"$set": {"status": "playing"}})
             current_status = "playing"
         
-        # Wysyłamy sygnał START do pokoju (odblokowuje okna czekania)
-        # Robimy to ZAWSZE przy wejściu kogokolwiek, gdy pokój jest pełny
-        def send_start_signal():
-            socketio.emit('game_start_signal', {'msg': 'START'}, to=room)
-        eventlet.spawn_after(0.5, send_start_signal)
+        # WYŚLIJ SYGNAŁ STARTU! (To zamyka okno czekania)
+        # Wysyłamy z małym opóźnieniem, żeby klient zdążył odebrać 'join_success'
+        socketio.emit('game_start_signal', {'msg': 'START'}, to=room)
 
-    # 8. Wysyłka sukcesu do klienta
+    # 7. ODPOWIEDŹ DLA KLIENTA
     emit('join_success', {
         'room': room,
         'goal_desc': f"{r_data.get('goal_value')} {r_data.get('goal_type')}",
-        'is_new': not is_already_registered,
-        'status': current_status,
+        'is_new': not is_returning_player,
+        'status': current_status, # Klient tutaj dostanie info czy grać, czy czekać
         'saved_money': my_stats.get('money', 0),
         'saved_mps': my_stats.get('mps', 0)
     })
 
-    # 9. Dane przeciwnika (pętla pomija "siebie")
+    # 8. WYSŁANIE DANYCH PRZECIWNIKA
     for p_id, p_stats in fresh_players.items():
         if p_id != user_key:
             emit('opponent_progress', {
-                'username': p_stats.get('display_name', p_id), # Teraz zadziała, bo display_name jest zapisane
+                'username': p_stats.get('display_name', p_id),
                 'money': p_stats.get('money', 0),
                 'mps': p_stats.get('mps', 0)
             })
