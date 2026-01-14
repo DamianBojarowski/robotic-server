@@ -119,39 +119,43 @@ def on_create(data):
 
 @socketio.on('join_room_request')
 def on_join_req(data):
-    room = data['room']
-    raw_user = data['username'].strip()
+    room = data.get('room')
+    raw_user = data.get('username', '').strip()
     user_key = raw_user.lower()
     pwd_attempt = data.get('password', '')
 
     if not raw_user or user_key == "":
-        emit('error_log', {'msg': "NICK NIE MOŻE BYĆ PUSTY!"})
+        emit('error_log', {'msg': "BŁĄD: Nick nie może być pusty!"})
         return
 
     if rooms_collection is None: return
-    
+
+    # 1. Pobieramy dane pokoju
     r_data = rooms_collection.find_one({"_id": room})
     if not r_data:
         emit('error_log', {'msg': "Pokój nie istnieje!"})
         return
 
-    players = r_data.get('players', {}) 
+    players = r_data.get('players', {})
     is_already_registered = user_key in players
 
+    # 2. Sprawdzenie slotów (używamy realnej długości słownika players)
     if not is_already_registered and len(players) >= 2:
-        emit('error_log', {'msg': "POKÓJ PEŁNY: Zarezerwowany dla innych graczy!"})
+        emit('error_log', {'msg': "POKÓJ PEŁNY!"})
         return
 
-    if r_data['password'] and r_data['password'] != pwd_attempt:
+    # 3. Sprawdzenie hasła
+    if r_data.get('password') and r_data['password'] != pwd_attempt:
         emit('error_log', {'msg': "BŁĘDNE HASŁO!"})
         return
 
+    # 4. Dołączenie do SocketIO
     join_room(room)
 
-    # Aktualizacja bazy
+    # 5. Aktualizacja bazy danych
     if not is_already_registered:
         rooms_collection.update_one(
-            {"_id": room}, 
+            {"_id": room},
             {
                 "$set": {f"players.{user_key}": {'money': 0, 'mps': 0, 'display_name': raw_user}},
                 "$inc": {"player_count": 1},
@@ -160,39 +164,35 @@ def on_join_req(data):
         )
     else:
         rooms_collection.update_one({"_id": room}, {"$set": {"last_active": time.time()}})
-    
-    # Pobieramy świeże dane
+
+    # 6. Pobranie ŚWIEŻYCH danych po aktualizacji (to eliminuje błąd NoneType)
     r_data_fresh = rooms_collection.find_one({"_id": room})
     fresh_players = r_data_fresh.get('players', {})
-    my_stats = fresh_players.get(user_key)
+    
+    # Failsafe: jeśli bazy nie ma, tworzymy pusty obiekt, żeby .get() nie wywalił błędu
+    my_stats = fresh_players.get(user_key, {'money': 0, 'mps': 0})
 
-    # --- FIX: ZABEZPIECZENIE PRZED NoneType ---
-    if not my_stats:
-        my_stats = {'money': 0, 'mps': 0}
-    # ------------------------------------------
-
+    # 7. LOGIKA STARTU (Naprawia pokoje utknięte w 'waiting')
     current_status = r_data_fresh.get('status', 'waiting')
-    # 2. Sprawdzamy realną liczbę osób w słowniku (to jest źródło prawdy)
     if len(fresh_players) >= 2:
-        # 3. Jeśli jest komplet, a baza mówi, że wciąż czekamy...
-        if r_data_fresh.get('status') == 'waiting':
-            # ...to wymuszamy zmianę na "playing"
+        if current_status == 'waiting':
             rooms_collection.update_one({"_id": room}, {"$set": {"status": "playing"}})
-            print(f"--- [FIX] Naprawiono status pokoju {room} na 'playing' ---")
+            current_status = "playing"
         
-        # 4. ZAWSZE wysyłamy sygnał startu do obu okien. 
-        # Dzięki temu okno "Oczekiwanie" zniknie u obu graczy.
+        # Wysyłamy sygnał START (to zamknie okno czekania u obu graczy)
         socketio.emit('game_start_signal', {'msg': 'START'}, to=room)
 
+    # 8. Wysyłka sukcesu do klienta
     emit('join_success', {
         'room': room,
-        'goal_desc': f"{r_data['goal_value']} {r_data['goal_type']}",
+        'goal_desc': f"{r_data.get('goal_value')} {r_data.get('goal_type')}",
         'is_new': not is_already_registered,
         'status': current_status,
         'saved_money': my_stats.get('money', 0),
         'saved_mps': my_stats.get('mps', 0)
     })
-    
+
+    # 9. Przesłanie danych rywala (tylko jeśli to nie JA)
     for p_id, p_stats in fresh_players.items():
         if p_id != user_key:
             emit('opponent_progress', {
