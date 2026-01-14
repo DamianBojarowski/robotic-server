@@ -121,17 +121,15 @@ def on_create(data):
 def on_join_req(data):
     room = data['room']
     raw_user = data['username'].strip()
-    user_key = raw_user.lower()  # Techniczny identyfikator (małe litery)
+    user_key = raw_user.lower()
     pwd_attempt = data.get('password', '')
 
-    # --- ZABEZPIECZENIE 1: Pusty nick ---
     if not raw_user or user_key == "":
         emit('error_log', {'msg': "NICK NIE MOŻE BYĆ PUSTY!"})
         return
 
     if rooms_collection is None: return
     
-    # --- ZABEZPIECZENIE 2: Czy pokój istnieje? ---
     r_data = rooms_collection.find_one({"_id": room})
     if not r_data:
         emit('error_log', {'msg': "Pokój nie istnieje!"})
@@ -140,20 +138,17 @@ def on_join_req(data):
     players = r_data.get('players', {}) 
     is_already_registered = user_key in players
 
-    # --- ZABEZPIECZENIE 3: Blokada 2 slotów ---
     if not is_already_registered and len(players) >= 2:
         emit('error_log', {'msg': "POKÓJ PEŁNY: Zarezerwowany dla innych graczy!"})
         return
 
-    # Sprawdzenie hasła
     if r_data['password'] and r_data['password'] != pwd_attempt:
         emit('error_log', {'msg': "BŁĘDNE HASŁO!"})
         return
 
-    # 4. Dołączenie live
     join_room(room)
 
-    # 5. Aktualizacja bazy (Persistence)
+    # Aktualizacja bazy
     if not is_already_registered:
         rooms_collection.update_one(
             {"_id": room}, 
@@ -166,22 +161,23 @@ def on_join_req(data):
     else:
         rooms_collection.update_one({"_id": room}, {"$set": {"last_active": time.time()}})
     
-    # 6. POBIERANIE ŚWIEŻYCH DANYCH PO ZAPISIE
+    # Pobieramy świeże dane
     r_data_fresh = rooms_collection.find_one({"_id": room})
     fresh_players = r_data_fresh.get('players', {})
     my_stats = fresh_players.get(user_key)
-    
-    # --- LOGIKA STARTU GRY ---
+
+    # --- FIX: ZABEZPIECZENIE PRZED NoneType ---
+    if not my_stats:
+        my_stats = {'money': 0, 'mps': 0}
+    # ------------------------------------------
+
     current_status = r_data_fresh.get('status', 'waiting')
     if len(fresh_players) >= 2:
         if current_status == 'waiting':
             rooms_collection.update_one({"_id": room}, {"$set": {"status": "playing"}})
             current_status = "playing"
-        
-        # Sygnał START dla obu graczy (zamyka okno "Oczekiwanie")
         socketio.emit('game_start_signal', {'msg': 'START'}, to=room)
 
-    # 7. Wysyłka sukcesu do klienta
     emit('join_success', {
         'room': room,
         'goal_desc': f"{r_data['goal_value']} {r_data['goal_type']}",
@@ -191,7 +187,6 @@ def on_join_req(data):
         'saved_mps': my_stats.get('mps', 0)
     })
     
-    # 8. SYNC DANYCH RYWALA (Tylko jeśli to nie ja)
     for p_id, p_stats in fresh_players.items():
         if p_id != user_key:
             emit('opponent_progress', {
