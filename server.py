@@ -203,7 +203,7 @@ def on_update(data):
     money = data.get('money', 0)
     mps = data.get('mps', 0)
 
-    if not rooms_collection: return
+    if rooms_collection is None: return
 
     # Optymalizacja: Nie pobieramy całego dokumentu przy każdym update (za wolno)
     # Po prostu wysyłamy update do bazy i do rywala
@@ -253,7 +253,7 @@ def on_leave(data):
     room = data.get('room')
     user = data.get('username')
     
-    if not rooms_collection: return
+    if rooms_collection is None: return
 
     emit('player_left', {'username': user}, to=room)
     leave_room(room)
