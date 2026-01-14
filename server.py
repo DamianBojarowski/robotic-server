@@ -1,3 +1,10 @@
+import collections
+import collections.abc
+# --- FIX dla dnspython 1.16.0 na Python 3.10+ ---
+# Przywracamy funkcję, która została usunięta w nowym Pythonie
+if not hasattr(collections, 'MutableMapping'):
+    collections.MutableMapping = collections.abc.MutableMapping
+
 import eventlet
 eventlet.monkey_patch()
 
