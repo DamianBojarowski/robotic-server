@@ -156,7 +156,7 @@ def on_create(data):
         "goal_value": g_val,
         "players": {
             user_key: { 
-                'money': 0.0, 'mps': 0.0, 'display_name': raw_user, online: True
+                'money': 0.0, 'mps': 0.0, 'display_name': raw_user, 'online': True
             }
         },
         "player_count": 1,
