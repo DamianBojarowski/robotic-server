@@ -161,6 +161,7 @@ def on_join_req(data):
     user_key = raw_user.lower()
     pwd_attempt = data.get('password', '')
 
+    # --- WALIDACJA WSTĘPNA ---
     if not raw_user:
         emit('error_log', {'msg': "Nick pusty!"})
         return
@@ -168,45 +169,25 @@ def on_join_req(data):
         emit('error_log', {'msg': "Nick 'Gracz' zabroniony!"})
         return
 
+    # Pobieramy podstawowe info (czy pokój istnieje, czy hasło OK)
+    # NIE SPRAWDZAMY TU JESZCZE LICZBY GRACZY
     r_data = rooms_col.find_one({"_id": room})
     if not r_data:
         emit('error_log', {'msg': "Pokój nie istnieje!"})
-        return
-
-    players = r_data.get('players', {})
-    
-    # --- TERMINATOR (Czyszczenie tłoku) ---
-    if len(players) > 2:
-        print(f"--- [CRITICAL] Czyszczenie tłoku w {room} ---")
-        valid_keys = []
-        if user_key in players: valid_keys.append(user_key)
-        for k in players.keys():
-            if len(valid_keys) < 2 and k != user_key: valid_keys.append(k)
-        
-        cleaned_players = {k: players[k] for k in valid_keys}
-        rooms_col.update_one({"_id": room}, {"$set": {"players": cleaned_players, "player_count": len(cleaned_players)}})
-        emit('error_log', {'msg': "Synchronizacja... Spróbuj ponownie."})
-        return
-    # -------------------------------------
-
-    is_already_registered = user_key in players
-
-    if not is_already_registered and len(players) >= 2:
-        emit('error_log', {'msg': "POKÓJ PEŁNY!"})
         return
 
     if r_data.get('password') and r_data['password'] != pwd_attempt:
         emit('error_log', {'msg': "BŁĘDNE HASŁO!"})
         return
 
-    join_room(room)
-    
-    # ZAPISUJEMY W PAMIĘCI RAM SERWERA
-    active_sockets[request.sid] = {'room': room, 'user': raw_user}
-
+    # --- KLUCZOWA ZMIANA: LOGIKA DOŁĄCZANIA ---
     current_time = time.time()
     
-    if is_already_registered:
+    # KROK 1: Sprawdź, czy gracz JUŻ TAM JEST.
+    # Jeśli tak - tylko aktualizujemy czas i nick (nie zwiększamy licznika).
+    is_already_in = False
+    if user_key in r_data.get('players', {}):
+        is_already_in = True
         rooms_col.update_one(
             {"_id": room}, 
             {"$set": {
@@ -215,8 +196,14 @@ def on_join_req(data):
             }}
         )
     else:
-        rooms_col.update_one(
-            {"_id": room},
+        # KROK 2: Jeśli gracza NIE MA, próbujemy go wcisnąć.
+        # Używamy ATOMOWEGO zapytania. Warunek "player_count < 2" jest w zapytaniu do bazy!
+        # Dzięki temu, jeśli w bazie jest już 2 graczy, update_one zwróci modified_count = 0.
+        result = rooms_col.update_one(
+            {
+                "_id": room, 
+                "player_count": {"$lt": 2}  # <--- TO JEST ZABEZPIECZENIE PRZED 3 GRACZEM
+            },
             {
                 "$set": {
                     f"players.{user_key}": {
@@ -224,15 +211,26 @@ def on_join_req(data):
                     },
                     "last_active": current_time
                 },
-                "$inc": {"player_count": 1}
+                "$inc": {"player_count": 1} # Zwiększ licznik tylko jeśli warunek $lt 2 został spełniony
             }
         )
 
+        # Jeśli baza odmówiła aktualizacji (bo player_count był >= 2), wyrzuć błąd
+        if result.modified_count == 0:
+            emit('error_log', {'msg': "POKÓJ PEŁNY! (Ktoś zajął miejsce szybciej)"})
+            return
+
+    # --- RESZTA LOGIKI (Sukces) ---
+    join_room(room)
+    active_sockets[request.sid] = {'room': room, 'user': raw_user}
+
+    # Pobieramy świeże dane po aktualizacji
     r_data_fresh = rooms_col.find_one({"_id": room})
     fresh_players = r_data_fresh.get('players', {})
     my_stats = fresh_players.get(user_key, {'money': 0, 'mps': 0})
     current_status = r_data_fresh.get('status', 'waiting')
 
+    # Start gry, jeśli jest 2 graczy
     if len(fresh_players) >= 2:
         if current_status == 'waiting':
             rooms_col.update_one({"_id": room}, {"$set": {"status": "playing"}})
@@ -242,7 +240,7 @@ def on_join_req(data):
     emit('join_success', {
         'room': room,
         'goal_desc': f"{r_data.get('goal_value')} {r_data.get('goal_type')}",
-        'is_new': not is_already_registered,
+        'is_new': not is_already_in,
         'status': current_status,
         'saved_money': my_stats.get('money', 0),
         'saved_mps': my_stats.get('mps', 0)
