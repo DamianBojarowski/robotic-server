@@ -40,6 +40,38 @@ def get_db():
 INACTIVE_TIMEOUT = 172800  # 48h
 EMPTY_ROOM_TIMEOUT = 900   # 15 min
 
+def player_rejoin(room: str, user_key: str, display_name: str) -> bool:
+    """Oznacza gracza jako online. Zwraca True jeśli udało się go „obudzić”."""
+    col = get_db()
+    res = col.update_one(
+        {"_id": room, f"players.{user_key}": {"$exists": True}},
+        {
+            "$set": {
+                f"players.{user_key}.online": True,
+                f"players.{user_key}.display_name": display_name,
+                "last_active": time.time()
+            },
+            "$inc": {"player_count": 1}
+        }
+    )
+    return res.modified_count > 0
+
+
+def player_leave(room: str, user_key: str):
+    """Oznacza gracza jako offline (nie usuwamy go z dokumentu)."""
+    col = get_db()
+    col.update_one(
+        {"_id": room, f"players.{user_key}.online": True},
+        {
+            "$set": {
+                f"players.{user_key}.online": False,
+                "last_active": time.time()
+            },
+            "$inc": {"player_count": -1}
+        }
+    )
+
+
 @app.route('/')
 def index():
     return "SERVER ROBOTIC EMPIRE DZIAŁA! (Auto-Disconnect Active)"
@@ -75,24 +107,16 @@ def on_connect(auth=None):
 # --- NOWOŚĆ: AUTOMATYCZNE WYLOGOWANIE PRZY ZERWANIU SIECI ---
 @socketio.on('disconnect')
 def on_disconnect():
-    # Sprawdzamy czy ten socket był kimś ważnym
-    if request.sid in active_sockets:
-        data = active_sockets[request.sid]
-        room = data['room']
-        user = data['user']
-        
-        print(f"--- [DISCONNECT] {user} rozłączył się z {room} ---")
-        
-        # 1. Wysyłamy info do rywala: "Ten gracz wyszedł"
-        emit('player_left', {'username': user}, to=room)
-        
-        # 2. Usuwamy z księgi gości
-        del active_sockets[request.sid]
-        
-        # 3. Aktualizujemy czas w bazie (żeby pokój nie wygasł natychmiast)
-        rooms_col = get_db()
-        if rooms_col:
-            rooms_col.update_one({"_id": room}, {"$set": {"last_active": time.time()}})
+    if request.sid not in active_sockets:
+        return
+    room = active_sockets[request.sid]['room']
+    user = active_sockets[request.sid]['user']
+    user_key = user.lower()
+
+    player_leave(room, user_key)          # <-- oznaczamy offline
+    emit('player_left', {'username': user}, to=room)
+    del active_sockets[request.sid]
+    socketio.emit('rooms_list_update', get_public_rooms_list())
 
 @socketio.on('create_room')
 def on_create(data):
@@ -132,7 +156,7 @@ def on_create(data):
         "goal_value": g_val,
         "players": {
             user_key: { 
-                'money': 0.0, 'mps': 0.0, 'display_name': raw_user
+                'money': 0.0, 'mps': 0.0, 'display_name': raw_user, online: True
             }
         },
         "player_count": 1,
@@ -154,104 +178,84 @@ def on_create(data):
 
 @socketio.on('join_room_request')
 def on_join_req(data):
-    rooms_col = get_db()
-    
-    room = data.get('room')
-    raw_user = data.get('username', '').strip()
-    user_key = raw_user.lower()
-    pwd_attempt = data.get('password', '')
+    col = get_db()
 
-    # --- WALIDACJA WSTĘPNA ---
-    if not raw_user:
-        emit('error_log', {'msg': "Nick pusty!"})
-        return
-    if user_key == "gracz":
-        emit('error_log', {'msg': "Nick 'Gracz' zabroniony!"})
+    room      = data.get('room')
+    raw_user  = data.get('username', '').strip()
+    user_key  = raw_user.lower()
+    pwd       = data.get('password', '')
+
+    if not raw_user or user_key == "gracz":
+        emit('error_log', {'msg': "Nick niepoprawny!"})
         return
 
-    # Pobieramy podstawowe info (czy pokój istnieje, czy hasło OK)
-    # NIE SPRAWDZAMY TU JESZCZE LICZBY GRACZY
-    r_data = rooms_col.find_one({"_id": room})
+    r_data = col.find_one({"_id": room})
     if not r_data:
-        emit('error_log', {'msg': "Pokój nie istnieje!"})
+        emit('error_log', {'msg': "Brak pokoju"})
+        return
+    if r_data.get('password') and r_data['password'] != pwd:
+        emit('error_log', {'msg': "Złe hasło"})
         return
 
-    if r_data.get('password') and r_data['password'] != pwd_attempt:
-        emit('error_log', {'msg': "BŁĘDNE HASŁO!"})
-        return
+    players = r_data.get('players', {})
+    my_doc  = players.get(user_key)
 
-    # --- KLUCZOWA ZMIANA: LOGIKA DOŁĄCZANIA ---
-    current_time = time.time()
-    
-    # KROK 1: Sprawdź, czy gracz JUŻ TAM JEST.
-    # Jeśli tak - tylko aktualizujemy czas i nick (nie zwiększamy licznika).
-    is_already_in = False
-    if user_key in r_data.get('players', {}):
-        is_already_in = True
-        rooms_col.update_one(
-            {"_id": room}, 
-            {"$set": {
-                "last_active": current_time,
-                f"players.{user_key}.display_name": raw_user
-            }}
-        )
+    # 1) REJOIN – jeśli już kiedyś tu był
+    if my_doc:
+        if my_doc.get('online', False):
+            emit('error_log', {'msg': "Już jesteś w tym pokoju!"})
+            return
+        # budzimy go
+        ok = player_rejoin(room, user_key, raw_user)
+        if not ok:
+            emit('error_log', {'msg': "Błąd rejoin"})
+            return
     else:
-        # KROK 2: Jeśli gracza NIE MA, próbujemy go wcisnąć.
-        # Używamy ATOMOWEGO zapytania. Warunek "player_count < 2" jest w zapytaniu do bazy!
-        # Dzięki temu, jeśli w bazie jest już 2 graczy, update_one zwróci modified_count = 0.
-        result = rooms_col.update_one(
-            {
-                "_id": room, 
-                "player_count": {"$lt": 2}  # <--- TO JEST ZABEZPIECZENIE PRZED 3 GRACZEM
-            },
+        # 2) NOWY – można wejść tylko gdy < 2 online
+        if r_data.get('player_count', 0) >= 2:
+            emit('error_log', {'msg': "Pokój pełny (2 graczy online)"})
+            return
+        # dodajemy nowego
+        col.update_one(
+            {"_id": room, "player_count": {"$gt": 0}, f"players.{user_key}.online": True},
             {
                 "$set": {
                     f"players.{user_key}": {
-                        'money': 0.0, 'mps': 0.0, 'display_name': raw_user
+                        'money': 0, 'mps': 0,
+                        'display_name': raw_user,
+                        'online': True
                     },
-                    "last_active": current_time
+                    "last_active": time.time()
                 },
-                "$inc": {"player_count": 1} # Zwiększ licznik tylko jeśli warunek $lt 2 został spełniony
+                "$inc": {"player_count": 1}
             }
         )
 
-        # Jeśli baza odmówiła aktualizacji (bo player_count był >= 2), wyrzuć błąd
-        if result.modified_count == 0:
-            emit('error_log', {'msg': "POKÓJ PEŁNY! (Ktoś zajął miejsce szybciej)"})
-            return
-
-    # --- RESZTA LOGIKI (Sukces) ---
+    # --- standard dalej: dołącz do pokoju SocketIO, emit success, ew. start gry ---
     join_room(room)
     active_sockets[request.sid] = {'room': room, 'user': raw_user}
 
-    # Pobieramy świeże dane po aktualizacji
-    r_data_fresh = rooms_col.find_one({"_id": room})
-    fresh_players = r_data_fresh.get('players', {})
-    my_stats = fresh_players.get(user_key, {'money': 0, 'mps': 0})
-    current_status = r_data_fresh.get('status', 'waiting')
-
-    # Start gry, jeśli jest 2 graczy
-    if len(fresh_players) >= 2:
-        if current_status == 'waiting':
-            rooms_col.update_one({"_id": room}, {"$set": {"status": "playing"}})
-            current_status = "playing"
+    fresh = col.find_one({"_id": room})
+    if fresh['player_count'] == 2 and fresh.get('status') == 'waiting':
+        col.update_one({"_id": room}, {"$set": {"status": "playing"}})
         socketio.emit('game_start_signal', {'msg': 'START'}, to=room)
 
     emit('join_success', {
         'room': room,
         'goal_desc': f"{r_data.get('goal_value')} {r_data.get('goal_type')}",
-        'is_new': not is_already_in,
-        'status': current_status,
-        'saved_money': my_stats.get('money', 0),
-        'saved_mps': my_stats.get('mps', 0)
+        'is_new': my_doc is None,
+        'status': fresh.get('status', 'waiting'),
+        'saved_money': fresh['players'][user_key]['money'],
+        'saved_mps': fresh['players'][user_key]['mps']
     })
 
-    for p_id, p_stats in fresh_players.items():
-        if p_id != user_key:
+    # wyślij rywalowi jego statystyki
+    for k, v in fresh['players'].items():
+        if k != user_key and v.get('online'):
             emit('opponent_progress', {
-                'username': p_stats.get('display_name', p_id),
-                'money': p_stats.get('money', 0),
-                'mps': p_stats.get('mps', 0)
+                'username': v['display_name'],
+                'money': v['money'],
+                'mps': v['mps']
             })
 
 @socketio.on('update_progress')
@@ -295,22 +299,16 @@ def on_update(data):
 
 @socketio.on('leave_game')
 def on_leave(data):
-    rooms_col = get_db()
-    if rooms_col is None: return
-
     room = data.get('room')
     user = data.get('username')
-    
-    # Usuwamy z Księgi Gości, bo wychodzi świadomie
+    user_key = user.lower()
+
     if request.sid in active_sockets:
         del active_sockets[request.sid]
-    
-    emit('player_left', {'username': user}, to=room)
     leave_room(room)
-    
-    rooms_col.update_one({"_id": room}, {"$set": {"last_active": time.time()}})
-    
-    print(f"--- [LEAVE] {user} wyszedł z {room} (świadomie) ---")
+
+    player_leave(room, user_key)
+    emit('player_left', {'username': user}, to=room)
     socketio.emit('rooms_list_update', get_public_rooms_list())
     
 @socketio.on('request_rooms_list')
@@ -318,32 +316,20 @@ def on_list_req():
     emit('rooms_list_update', get_public_rooms_list())
 
 def get_public_rooms_list():
-    rooms_col = get_db()
-    if rooms_col is None: return []
-    
-    cursor = rooms_col.find({
-        "$or": [
-            {"status": "waiting"},
-            {"player_count": {"$lt": 2}}
-        ]
-    })
-    
-    public_list = []
-    for r_data in cursor:
-        g_val = r_data.get('goal_value', 0)
-        if g_val == -1:
-            goal_str = "BEZ LIMITU"
-        else:
-            suffix = " PLN" if r_data.get('goal_type') == 'money' else "/s"
-            goal_str = f"{g_val}{suffix}"
-            
-        public_list.append({
-            'name': r_data['_id'],
+    col = get_db()
+    cursor = col.find({"player_count": {"$lt": 2}})
+    out = []
+    for r in cursor:
+        g_val = r.get('goal_value', 0)
+        suffix = " PLN" if r.get('goal_type') == 'money' else "/s"
+        goal_str = "BEZ LIMITU" if g_val == -1 else f"{g_val}{suffix}"
+        out.append({
+            'name': r['_id'],
             'goal': goal_str,
-            'players': r_data.get('player_count', 0),
-            'locked': bool(r_data.get('password'))
+            'players': r.get('player_count', 0),
+            'locked': bool(r.get('password'))
         })
-    return public_list
+    return out
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
