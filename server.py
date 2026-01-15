@@ -224,7 +224,7 @@ def on_join_req(data):
             return
         # dodajemy nowego
         col.update_one(
-            {"_id": room, "player_count": {"$gt": 0}, f"players.{user_key}.online": True},
+            {"_id": room},
             {
                 "$set": {
                     f"players.{user_key}": {
@@ -252,8 +252,8 @@ def on_join_req(data):
         'goal_desc': f"{r_data.get('goal_value')} {r_data.get('goal_type')}",
         'is_new': my_doc is None,
         'status': fresh.get('status', 'waiting'),
-        'saved_money': fresh['players'][user_key]['money'],
-        'saved_mps': fresh['players'][user_key]['mps']
+        'saved_money': saved_money, # Używamy bezpiecznych zmiennych
+        'saved_mps': saved_mps
     })
 
     # wyślij rywalowi jego statystyki
