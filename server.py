@@ -212,19 +212,19 @@ def on_join_req(data):
             return
     else:
         # 2) NOWY GRACZ
-        # Sprawdź czy pokój jest w fazie oczekiwania.
-        # Jeśli status to 'playing' lub 'finished', nie wpuszczaj nowego,
-        # nawet jeśli player_count < 2 (bo to oznacza, że ktoś tylko wyszedł na chwilę).
+        # Sprawdź czy gra już trwa (nie wpuszczaj, jeśli status to playing/finished)
         if r_data.get('status') != 'waiting':
-             emit('error_log', {'msg': "Gra w toku - nie można dołączyć jako nowy gracz."})
+             emit('error_log', {'msg': "Gra w toku - za późno!"})
              return
 
         if r_data.get('player_count', 0) >= 2:
             emit('error_log', {'msg': "Pokój pełny"})
             return
-        # dodajemy nowego
+        
+        # --- POPRAWKA BAZY DANYCH ---
+        # Dodajemy gracza bezwarunkowo (szukamy tylko po ID pokoju)
         col.update_one(
-            {"_id": room},
+            {"_id": room}, 
             {
                 "$set": {
                     f"players.{user_key}": {
@@ -238,31 +238,49 @@ def on_join_req(data):
             }
         )
 
-    # --- standard dalej: dołącz do pokoju SocketIO, emit success, ew. start gry ---
+    # --- WSPÓLNA CZĘŚĆ (DOŁĄCZANIE DO SOCKETÓW) ---
     join_room(room)
     active_sockets[request.sid] = {'room': room, 'user': raw_user}
 
+    # Pobieramy najświeższe dane z bazy po aktualizacji
     fresh = col.find_one({"_id": room})
-    if fresh['player_count'] == 2 and fresh.get('status') == 'waiting':
+    
+    # --- KLUCZOWA POPRAWKA LOGIKI STARTU ---
+    # Domyślny status to ten z bazy
+    current_status = fresh.get('status', 'waiting')
+    
+    # Jeśli właśnie wbił drugi gracz i gra czekała -> ZMIENIAMY STATUS NA PLAYING
+    if fresh.get('player_count', 0) >= 2 and current_status == 'waiting':
+        current_status = 'playing' # Nadpisujemy zmienną lokalną dla gracza 2
         col.update_one({"_id": room}, {"$set": {"status": "playing"}})
+        # Emitujemy sygnał startu do wszystkich W TYM POKOJU (dla gracza 1)
         socketio.emit('game_start_signal', {'msg': 'START'}, to=room)
 
+    # Bezpieczne pobieranie danych gracza (żeby nie było KeyError)
+    player_data = fresh.get('players', {}).get(user_key, {})
+    saved_money = player_data.get('money', 0)
+    saved_mps = player_data.get('mps', 0)
+
+    # Wysyłamy sukces do gracza, który właśnie dołączył
+    # WAŻNE: Wysyłamy obliczony 'current_status'. 
+    # Jeśli to gracz nr 2, dostanie od razu 'playing' i gra mu się włączy.
     emit('join_success', {
         'room': room,
         'goal_desc': f"{r_data.get('goal_value')} {r_data.get('goal_type')}",
         'is_new': my_doc is None,
-        'status': fresh.get('status', 'waiting'),
-        'saved_money': saved_money, # Używamy bezpiecznych zmiennych
+        'status': current_status, 
+        'saved_money': saved_money,
         'saved_mps': saved_mps
     })
 
-    # wyślij rywalowi jego statystyki
-    for k, v in fresh['players'].items():
+    # Wysyłamy informację o rywalach
+    players_list = fresh.get('players', {})
+    for k, v in players_list.items():
         if k != user_key and v.get('online'):
             emit('opponent_progress', {
                 'username': v['display_name'],
-                'money': v['money'],
-                'mps': v['mps']
+                'money': v.get('money', 0),
+                'mps': v.get('mps', 0)
             })
 
 @socketio.on('update_progress')
