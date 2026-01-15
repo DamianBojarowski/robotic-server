@@ -7,7 +7,7 @@ if not hasattr(collections, 'MutableMapping'):
 import eventlet
 eventlet.monkey_patch()
 
-from flask import Flask, request # <--- WAŻNE: Dodano request
+from flask import Flask, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
 import os
 import time
@@ -18,8 +18,8 @@ app.config['SECRET_KEY'] = 'sekret_robotow'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', ping_timeout=25, ping_interval=10)
 
 # --- GLOBALNA KSIĘGA GOŚCI ---
-# Śledzi, kto jest pod danym ID połączenia.
-# Format: { 'socket_id': {'room': 'arena1', 'user': 'lewy'} }
+											  
+															 
 active_sockets = {} 
 
 # --- BAZA DANYCH ---
@@ -41,7 +41,7 @@ INACTIVE_TIMEOUT = 172800  # 48h
 EMPTY_ROOM_TIMEOUT = 900   # 15 min
 
 def player_rejoin(room: str, user_key: str, display_name: str) -> bool:
-    """Oznacza gracza jako online. Zwraca True jeśli udało się go „obudzić”."""
+    """Oznacza gracza jako online."""
     col = get_db()
     res = col.update_one(
         {"_id": room, f"players.{user_key}": {"$exists": True}},
@@ -58,7 +58,7 @@ def player_rejoin(room: str, user_key: str, display_name: str) -> bool:
 
 
 def player_leave(room: str, user_key: str):
-    """Oznacza gracza jako offline (nie usuwamy go z dokumentu)."""
+    """Oznacza gracza jako offline."""
     col = get_db()
     col.update_one(
         {"_id": room, f"players.{user_key}.online": True},
@@ -74,7 +74,7 @@ def player_leave(room: str, user_key: str):
 
 @app.route('/')
 def index():
-    return "SERVER ROBOTIC EMPIRE DZIAŁA! (Auto-Disconnect Active)"
+    return "SERVER ROBOTIC EMPIRE DZIAŁA! (Fix: Logic & KeyError)"
 
 def cleanup_loop():
     while True:
@@ -83,19 +83,19 @@ def cleanup_loop():
         if rooms_col is None: continue 
         
         now = time.time()
-        
+		
         # Usuń stare pokoje waiting
         rooms_col.delete_many({
-            "status": "waiting",
+            "status": "waiting", 
             "last_active": {"$lt": now - EMPTY_ROOM_TIMEOUT},
             "player_count": {"$lt": 2}
         })
-        
+		
         # Usuń bardzo stare pokoje
         rooms_col.delete_many({
             "last_active": {"$lt": now - INACTIVE_TIMEOUT}
         })
-        
+		
         socketio.emit('rooms_list_update', get_public_rooms_list())
 
 socketio.start_background_task(cleanup_loop)
@@ -104,7 +104,7 @@ socketio.start_background_task(cleanup_loop)
 def on_connect(auth=None):
     emit('rooms_list_update', get_public_rooms_list())
 
-# --- NOWOŚĆ: AUTOMATYCZNE WYLOGOWANIE PRZY ZERWANIU SIECI ---
+																
 @socketio.on('disconnect')
 def on_disconnect():
     if request.sid not in active_sockets:
@@ -113,15 +113,28 @@ def on_disconnect():
     user = active_sockets[request.sid]['user']
     user_key = user.lower()
 
-    player_leave(room, user_key)          # <-- oznaczamy offline
+    player_leave(room, user_key)
     emit('player_left', {'username': user}, to=room)
     del active_sockets[request.sid]
     socketio.emit('rooms_list_update', get_public_rooms_list())
 
+# --- FUNKCJA POMOCNICZA DO PRZEŁĄCZANIA POKOI ---
+def handle_implicit_leave(sid):
+    """Jeśli socket jest już w innym pokoju, wyloguj go stamtąd."""
+    if sid in active_sockets:
+        old_room = active_sockets[sid]['room']
+        old_user = active_sockets[sid]['user']
+        leave_room(old_room)
+        player_leave(old_room, old_user.lower())
+        emit('player_left', {'username': old_user}, to=old_room)
+        # Nie usuwamy z active_sockets tutaj, bo zaraz zostanie nadpisane
+
 @socketio.on('create_room')
 def on_create(data):
-    rooms_col = get_db()
+    handle_implicit_leave(request.sid) # <--- FIX: Wyloguj ze starego pokoju
     
+    rooms_col = get_db()
+	
     room = data.get('room', '').strip()
     raw_user = data.get('username', '').strip()
     user_key = raw_user.lower()
@@ -130,14 +143,14 @@ def on_create(data):
     g_type = data.get('goal_type', 'money')
     g_val = data.get('goal_value', 1000000)
 
-    if not room:
-        emit('error_log', {'msg': "Nazwa pokoju pusta!"})
-        return
-    if not raw_user:
-        emit('error_log', {'msg': "Nick pusty!"})
+				
+														 
+			  
+    if not room or not raw_user:
+        emit('error_log', {'msg': "Dane niekompletne!"})
         return
     if user_key == "gracz":
-        emit('error_log', {'msg': "Nick 'Gracz' jest zabroniony."})
+        emit('error_log', {'msg': "Nick 'Gracz' zabroniony."})
         return
 
     if rooms_col.find_one({"_id": room}):
@@ -145,8 +158,8 @@ def on_create(data):
         return
 
     join_room(room)
-    
-    # ZAPISUJEMY W PAMIĘCI RAM SERWERA
+	
+									   
     active_sockets[request.sid] = {'room': room, 'user': raw_user}
     
     room_doc = {
@@ -178,6 +191,8 @@ def on_create(data):
 
 @socketio.on('join_room_request')
 def on_join_req(data):
+    handle_implicit_leave(request.sid) # <--- FIX: Wyloguj ze starego pokoju
+
     col = get_db()
 
     room      = data.get('room')
@@ -200,19 +215,22 @@ def on_join_req(data):
     players = r_data.get('players', {})
     my_doc  = players.get(user_key)
 
-    # 1) REJOIN – jeśli już kiedyś tu był
+    # 1) REJOIN
     if my_doc:
         if my_doc.get('online', False):
-            emit('error_log', {'msg': "Już jesteś w tym pokoju!"})
+            # Tu wchodzi FIX z handle_implicit_leave:
+            # Ponieważ wywołaliśmy to na górze, stary status online powinien zniknąć,
+            # chyba że to ten sam pokój i ten sam nick.
+            emit('error_log', {'msg': "Gracz o tym nicku już tu jest!"})
             return
-        # budzimy go
+					
         ok = player_rejoin(room, user_key, raw_user)
         if not ok:
-            emit('error_log', {'msg': "Błąd rejoin"})
+            emit('error_log', {'msg': "Błąd bazy danych (rejoin)"})
             return
     else:
-        # 2) NOWY GRACZ
-        # Sprawdź czy gra już trwa (nie wpuszczaj, jeśli status to playing/finished)
+        # 2) NEW PLAYER
+																					   
         if r_data.get('status') != 'waiting':
              emit('error_log', {'msg': "Gra w toku - za późno!"})
              return
@@ -221,8 +239,8 @@ def on_join_req(data):
             emit('error_log', {'msg': "Pokój pełny"})
             return
         
-        # --- POPRAWKA BAZY DANYCH ---
-        # Dodajemy gracza bezwarunkowo (szukamy tylko po ID pokoju)
+									  
+																   
         col.update_one(
             {"_id": room}, 
             {
@@ -238,32 +256,33 @@ def on_join_req(data):
             }
         )
 
-    # --- WSPÓLNA CZĘŚĆ (DOŁĄCZANIE DO SOCKETÓW) ---
+    # Dołączenie do pokoju w RAM
     join_room(room)
     active_sockets[request.sid] = {'room': room, 'user': raw_user}
 
-    # Pobieramy najświeższe dane z bazy po aktualizacji
+    # Pobieramy świeże dane
     fresh = col.find_one({"_id": room})
     
-    # --- KLUCZOWA POPRAWKA LOGIKI STARTU ---
-    # Domyślny status to ten z bazy
+    # Logika startu gry
+									
     current_status = fresh.get('status', 'waiting')
-    
-    # Jeśli właśnie wbił drugi gracz i gra czekała -> ZMIENIAMY STATUS NA PLAYING
+	
+																					  
     if fresh.get('player_count', 0) >= 2 and current_status == 'waiting':
-        current_status = 'playing' # Nadpisujemy zmienną lokalną dla gracza 2
+        current_status = 'playing'
         col.update_one({"_id": room}, {"$set": {"status": "playing"}})
-        # Emitujemy sygnał startu do wszystkich W TYM POKOJU (dla gracza 1)
+																			
         socketio.emit('game_start_signal', {'msg': 'START'}, to=room)
 
-    # Bezpieczne pobieranie danych gracza (żeby nie było KeyError)
-    player_data = fresh.get('players', {}).get(user_key, {})
-    saved_money = player_data.get('money', 0)
-    saved_mps = player_data.get('mps', 0)
+    # --- FIX KEYERROR: Bezpieczne pobieranie danych ---
+    # Używamy .get() wszędzie, aby nie wywalić serwera, gdy baza ma laga
+    p_data = fresh.get('players', {}).get(user_key, {})
+    saved_money = p_data.get('money', 0)
+    saved_mps   = p_data.get('mps', 0)
 
-    # Wysyłamy sukces do gracza, który właśnie dołączył
-    # WAŻNE: Wysyłamy obliczony 'current_status'. 
-    # Jeśli to gracz nr 2, dostanie od razu 'playing' i gra mu się włączy.
+															  
+													
+																			  
     emit('join_success', {
         'room': room,
         'goal_desc': f"{r_data.get('goal_value')} {r_data.get('goal_type')}",
@@ -273,12 +292,12 @@ def on_join_req(data):
         'saved_mps': saved_mps
     })
 
-    # Wysyłamy informację o rywalach
+    # Update listy rywali
     players_list = fresh.get('players', {})
     for k, v in players_list.items():
         if k != user_key and v.get('online'):
             emit('opponent_progress', {
-                'username': v['display_name'],
+                'username': v.get('display_name', 'Nieznany'),
                 'money': v.get('money', 0),
                 'mps': v.get('mps', 0)
             })
@@ -293,13 +312,13 @@ def on_update(data):
     money = data.get('money', 0)
     mps = data.get('mps', 0)
 
-    # Re-emit to opponent
+						 
     emit('opponent_progress', data, to=room, include_self=False)
     
-    # Save to DB
+				
     r_data = rooms_col.find_one({"_id": room}, {"status": 1, "goal_type": 1, "goal_value": 1})
     if not r_data: return
-    if r_data['status'] == 'finished': return
+    if r_data.get('status') == 'finished': return
 
     rooms_col.update_one(
         {"_id": room},
@@ -342,7 +361,7 @@ def on_list_req():
 
 def get_public_rooms_list():
     col = get_db()
-    # Pokaż tylko pokoje, które OCZEKUJĄ (status waiting) i mają miejsce
+																			
     cursor = col.find({
         "status": "waiting", 
         "player_count": {"$lt": 2}
