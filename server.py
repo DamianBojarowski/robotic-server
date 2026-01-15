@@ -147,15 +147,12 @@ def on_join_req(data):
     user_key = raw_user.lower()
     pwd_attempt = data.get('password', '')
 
-    # --- 1. WALIDACJA WEJŚCIOWA ---
-    if not raw_user:
-        emit('error_log', {'msg': "Nick nie może być pusty!"})
+    # --- 1. FIREWALL NA NAZWĘ "GRACZ" ---
+    if user_key == "gracz" or user_key == "":
+        emit('error_log', {'msg': "Niedozwolony nick! Wpisz swoją nazwę."})
         return
-    if user_key == "gracz":
-        emit('error_log', {'msg': "Zmień nick! 'Gracz' jest zablokowany."})
-        return
+    # ------------------------------------
 
-    # Pobieramy pokój
     r_data = rooms_col.find_one({"_id": room})
     if not r_data:
         emit('error_log', {'msg': "Pokój nie istnieje!"})
@@ -163,40 +160,44 @@ def on_join_req(data):
 
     players = r_data.get('players', {})
 
-    # --- 2. CLEANER (Sprzątacz) ---
-    # Jeśli w bazie jest > 2 graczy, usuwamy nadmiar
+    # --- 2. ODKURZACZ (Auto-naprawa bazy) ---
+    # Jeśli wchodzisz do pokoju i widzisz tam 3 osoby (bo wcześniej był błąd),
+    # ten kod usunie "Gracza" i zostawi tylko Ciebie i rywala.
     if len(players) > 2:
-        print(f"--- [CLEANER] Naprawiam tłok w pokoju {room} ---")
-        valid_players = {}
-        # Zachowujemy siebie (jeśli byliśmy)
+        print(f"--- [CLEANER] Usuwam nadmiarowych graczy z {room} ---")
+        keys_to_keep = []
+        
+        # Zawsze zachowaj "siebie" (jeśli już tam byłem)
         if user_key in players:
-            valid_players[user_key] = players[user_key]
-        # Dobieramy resztę do limitu 2
-        for k, v in players.items():
-            if len(valid_players) < 2 and k != user_key:
-                valid_players[k] = v
-        # Zapisujemy wyczyszczoną listę
-        rooms_col.update_one({"_id": room}, {"$set": {"players": valid_players}})
-        players = valid_players
+            keys_to_keep.append(user_key)
+            
+        # Dobierz resztę, ale NIGDY nie bierz "gracz"
+        for k in players.keys():
+            if len(keys_to_keep) < 2 and k != user_key and k != "gracz":
+                keys_to_keep.append(k)
+        
+        # Nadpisz bazę wersją naprawioną
+        new_players = {k: players[k] for k in keys_to_keep}
+        rooms_col.update_one({"_id": room}, {"$set": {"players": new_players}})
+        # Aktualizuj lokalną zmienną, żeby dalsza część kodu widziała 2 osoby
+        players = new_players 
+    # ----------------------------------------
 
-    # Sprawdzenie czy jest miejsce
     is_already_registered = user_key in players
+
+    # Jeśli po czyszczeniu nadal jest 2 obcych ludzi -> Blokada
     if not is_already_registered and len(players) >= 2:
         emit('error_log', {'msg': "POKÓJ PEŁNY!"})
         return
 
-    # Hasło
     if r_data.get('password') and r_data['password'] != pwd_attempt:
         emit('error_log', {'msg': "BŁĘDNE HASŁO!"})
         return
 
     join_room(room)
 
-    # --- 3. AKTUALIZACJA BAZY (Z "Samoleczeniem") ---
-    current_time = time.time()
-    
+    # Aktualizacja (Bezpieczna)
     if not is_already_registered:
-        # NOWY GRACZ: Tworzymy pełny obiekt
         rooms_col.update_one(
             {"_id": room},
             {
@@ -204,45 +205,41 @@ def on_join_req(data):
                     f"players.{user_key}": {
                         'money': 0.0, 
                         'mps': 0.0, 
-                        'display_name': raw_user # <--- TU JEST KLUCZ
+                        'display_name': raw_user
                     },
-                    "last_active": current_time
+                    "last_active": time.time()
                 }
             }
         )
-        # Fix licznika
         rooms_col.update_one({"_id": room}, {"$set": {"player_count": len(players) + 1}})
     else:
-        # POWRACAJĄCY GRACZ: Aktualizujemy czas ORAZ display_name (naprawa błędu!)
+        # Update dla powracającego (dla pewności nadpisujemy display_name)
         rooms_col.update_one(
             {"_id": room}, 
             {
                 "$set": {
-                    "last_active": current_time,
-                    f"players.{user_key}.display_name": raw_user # <--- TO NAPRAWI 'prawy'
+                    "last_active": time.time(),
+                    f"players.{user_key}.display_name": raw_user
                 }
             }
         )
 
-    # --- 4. START I DANE ---
-    # Pobieramy świeże dane po naprawie
+    # Pobieranie świeżych danych
     r_data_fresh = rooms_col.find_one({"_id": room})
     fresh_players = r_data_fresh.get('players', {})
     my_stats = fresh_players.get(user_key, {'money': 0, 'mps': 0})
     
     current_status = r_data_fresh.get('status', 'waiting')
     
-    # Jeśli jest 2 graczy -> GRA
+    # --- START GRY ---
     if len(fresh_players) >= 2:
-        # Naprawa statusu, jeśli utknął na 'waiting'
         if current_status == 'waiting':
             rooms_col.update_one({"_id": room}, {"$set": {"status": "playing"}})
             current_status = "playing"
         
-        # WYMUSZENIE STARTU (Odblokowuje okna)
+        # Wyślij sygnał, że gramy (odblokuj okna)
         socketio.emit('game_start_signal', {'msg': 'START'}, to=room)
 
-    # Wysyłka do mnie
     emit('join_success', {
         'room': room,
         'goal_desc': f"{r_data.get('goal_value')} {r_data.get('goal_type')}",
@@ -252,13 +249,10 @@ def on_join_req(data):
         'saved_mps': my_stats.get('mps', 0)
     })
 
-    # Wysyłka danych rywala
     for p_id, p_stats in fresh_players.items():
         if p_id != user_key:
-            # Zabezpieczenie: jeśli rywal nadal nie ma nazwy, użyj jego ID
-            d_name = p_stats.get('display_name', p_id)
             emit('opponent_progress', {
-                'username': d_name,
+                'username': p_stats.get('display_name', p_id),
                 'money': p_stats.get('money', 0),
                 'mps': p_stats.get('mps', 0)
             })
