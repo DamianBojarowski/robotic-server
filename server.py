@@ -295,11 +295,12 @@ def on_join_req(data):
     # Update listy rywali
     players_list = fresh.get('players', {})
     for k, v in players_list.items():
-        if k != user_key and v.get('online'):
+        if k != user_key:  # <--- USUNIĘTO WARUNEK "and v.get('online')"
             emit('opponent_progress', {
                 'username': v.get('display_name', 'Nieznany'),
                 'money': v.get('money', 0),
-                'mps': v.get('mps', 0)
+                'mps': v.get('mps', 0),
+                'is_online': v.get('online', False) # <--- Dodajemy informację o statusie
             })
 
 @socketio.on('update_progress')
