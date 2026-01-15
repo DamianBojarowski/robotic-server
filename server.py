@@ -23,7 +23,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', ping_t
 active_sockets = {} 
 
 # --- BAZA DANYCH ---
-MONGO_URI = "mongodb+srv://admin:bojar55555@cluster0.kugbsd0.mongodb.net/?appName=Cluster0"
+MONGO_URI = os.environ.get("MONGO_URI")
 db_client = None
 rooms_collection = None
 
@@ -211,9 +211,16 @@ def on_join_req(data):
             emit('error_log', {'msg': "Błąd rejoin"})
             return
     else:
-        # 2) NOWY – można wejść tylko gdy < 2 online
+        # 2) NOWY GRACZ
+        # Sprawdź czy pokój jest w fazie oczekiwania.
+        # Jeśli status to 'playing' lub 'finished', nie wpuszczaj nowego,
+        # nawet jeśli player_count < 2 (bo to oznacza, że ktoś tylko wyszedł na chwilę).
+        if r_data.get('status') != 'waiting':
+             emit('error_log', {'msg': "Gra w toku - nie można dołączyć jako nowy gracz."})
+             return
+
         if r_data.get('player_count', 0) >= 2:
-            emit('error_log', {'msg': "Pokój pełny (2 graczy online)"})
+            emit('error_log', {'msg': "Pokój pełny"})
             return
         # dodajemy nowego
         col.update_one(
@@ -317,7 +324,11 @@ def on_list_req():
 
 def get_public_rooms_list():
     col = get_db()
-    cursor = col.find({"player_count": {"$lt": 2}})
+    # Pokaż tylko pokoje, które OCZEKUJĄ (status waiting) i mają miejsce
+    cursor = col.find({
+        "status": "waiting", 
+        "player_count": {"$lt": 2}
+    })
     out = []
     for r in cursor:
         g_val = r.get('goal_value', 0)
