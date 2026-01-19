@@ -434,10 +434,11 @@ def on_login(data):
         'action': 'login'
     })
 
+# --- 1. MODYFIKACJA UPLOADU (Żeby dało się sortować ranking) ---
 @socketio.on('upload_cloud_save')
 def on_upload_save(data):
     user = data.get('username', '').strip()
-    pwd = data.get('password', '').strip() # Weryfikacja przy każdym zapisie dla bezpieczeństwa
+    pwd = data.get('password', '').strip()
     save_json = data.get('save_data', {})
     
     db = get_db().database
@@ -449,13 +450,101 @@ def on_upload_save(data):
         emit('cloud_action_result', {'success': False, 'msg': "Błąd autoryzacji!"})
         return
         
+    # Wyciągamy statystyki do rankingu (Lifetime Chips)
+    lc = save_json.get('lc', 0) # lc to lifetime_chips w wersji v2
+    
     now = time.time()
     users_col.update_one(
         {"_id": user.lower()},
-        {"$set": {"save_data": save_json, "save_date": now}}
+        {
+            "$set": {
+                "save_data": save_json, 
+                "save_date": now,
+                "ranking_score": lc # Zapisujemy osobno do sortowania
+            }
+        }
     )
     
     emit('cloud_action_result', {'success': True, 'msg': "Zapisano w chmurze!", 'timestamp': now})
+
+# --- 2. NOWE FUNKCJE SPOŁECZNOŚCIOWE ---
+
+@socketio.on('add_friend_request')
+def on_add_friend(data):
+    me = data.get('me', '').strip()
+    target = data.get('target', '').strip()
+    pwd = data.get('password', '').strip()
+    
+    db = get_db().database
+    users_col = db.users
+    
+    # Weryfikacja mnie
+    my_doc = users_col.find_one({"_id": me.lower()})
+    if not my_doc or not check_password_hash(my_doc['password'], pwd):
+        emit('friend_result', {'success': False, 'msg': "Błąd autoryzacji!"})
+        return
+        
+    # Weryfikacja celu
+    target_doc = users_col.find_one({"_id": target.lower()})
+    if not target_doc:
+        emit('friend_result', {'success': False, 'msg': "Taki gracz nie istnieje!"})
+        return
+        
+    if me.lower() == target.lower():
+        emit('friend_result', {'success': False, 'msg': "Nie możesz dodać siebie."})
+        return
+        
+    # Dodajemy do tablicy 'friends' (używając $addToSet żeby nie dublować)
+    users_col.update_one(
+        {"_id": me.lower()},
+        {"$addToSet": {"friends": target_doc['display_name']}} # Zapisujemy ładną nazwę
+    )
+    
+    emit('friend_result', {'success': True, 'msg': f"Dodano znajomego: {target_doc['display_name']}"})
+
+@socketio.on('get_leaderboard')
+def on_get_leaderboard(data):
+    mode = data.get('mode', 'global') # 'global' lub 'friends'
+    user = data.get('username', '').lower()
+    
+    db = get_db().database
+    users_col = db.users
+    
+    ranking_data = []
+    
+    if mode == 'global':
+        # Pobierz TOP 50 po lifetime chips
+        cursor = users_col.find({}, {"display_name": 1, "ranking_score": 1}).sort("ranking_score", -1).limit(50)
+        for doc in cursor:
+            ranking_data.append({
+                "name": doc.get('display_name', 'Nieznany'),
+                "score": doc.get('ranking_score', 0)
+            })
+            
+    elif mode == 'friends':
+        # Pobierz listę znajomych użytkownika
+        me_doc = users_col.find_one({"_id": user})
+        if me_doc:
+            friends_list = me_doc.get('friends', [])
+            # Dodaj też siebie do rankingu znajomych
+            friends_list.append(me_doc['display_name'])
+            
+            # Pobierz dane dla wszystkich z listy (case insensitive search)
+            # Tworzymy listę ID (lowercase) do zapytania
+            friends_ids = [f.lower() for f in friends_list]
+            
+            cursor = users_col.find(
+                {"_id": {"$in": friends_ids}}, 
+                {"display_name": 1, "ranking_score": 1}
+            ).sort("ranking_score", -1)
+            
+            for doc in cursor:
+                ranking_data.append({
+                    "name": doc.get('display_name', 'Nieznany'),
+                    "score": doc.get('ranking_score', 0)
+                })
+
+    emit('leaderboard_data', {'mode': mode, 'data': ranking_data})
 
 @socketio.on('download_cloud_save')
 def on_download_save(data):
