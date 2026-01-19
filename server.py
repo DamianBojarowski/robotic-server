@@ -13,6 +13,8 @@ import os
 import time
 from pymongo import MongoClient
 
+from werkzeug.security import generate_password_hash, check_password_hash
+
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'sekret_robotow'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', ping_timeout=25, ping_interval=10)
@@ -379,6 +381,101 @@ def get_public_rooms_list():
             'locked': bool(r.get('password'))
         })
     return out
+
+@socketio.on('register_account')
+def on_register(data):
+    user = data.get('username', '').strip()
+    pwd = data.get('password', '').strip()
+    
+    if not user or not pwd:
+        emit('auth_result', {'success': False, 'msg': "Puste dane!"})
+        return
+        
+    db = get_db().database # Pobieramy obiekt bazy z kolekcji rooms
+    users_col = db.users   # Nowa kolekcja 'users'
+    
+    if users_col.find_one({"_id": user.lower()}):
+        emit('auth_result', {'success': False, 'msg': "Nick zajęty!"})
+        return
+        
+    # Tworzymy usera
+    users_col.insert_one({
+        "_id": user.lower(),
+        "display_name": user,
+        "password": generate_password_hash(pwd),
+        "save_data": None,
+        "save_date": None
+    })
+    
+    emit('auth_result', {'success': True, 'msg': "Konto założone! Zaloguj się.", 'action': 'register'})
+
+@socketio.on('login_account')
+def on_login(data):
+    user = data.get('username', '').strip()
+    pwd = data.get('password', '').strip()
+    
+    db = get_db().database
+    users_col = db.users
+    
+    doc = users_col.find_one({"_id": user.lower()})
+    
+    if not doc or not check_password_hash(doc['password'], pwd):
+        emit('auth_result', {'success': False, 'msg': "Błędny login lub hasło!"})
+        return
+        
+    # Pobieramy datę ostatniego zapisu (jeśli istnieje)
+    save_date = doc.get('save_date', 0)
+    
+    emit('auth_result', {
+        'success': True, 
+        'msg': f"Witaj, {doc['display_name']}!", 
+        'username': doc['display_name'],
+        'save_date': save_date,
+        'action': 'login'
+    })
+
+@socketio.on('upload_cloud_save')
+def on_upload_save(data):
+    user = data.get('username', '').strip()
+    pwd = data.get('password', '').strip() # Weryfikacja przy każdym zapisie dla bezpieczeństwa
+    save_json = data.get('save_data', {})
+    
+    db = get_db().database
+    users_col = db.users
+    
+    doc = users_col.find_one({"_id": user.lower()})
+    
+    if not doc or not check_password_hash(doc['password'], pwd):
+        emit('cloud_action_result', {'success': False, 'msg': "Błąd autoryzacji!"})
+        return
+        
+    now = time.time()
+    users_col.update_one(
+        {"_id": user.lower()},
+        {"$set": {"save_data": save_json, "save_date": now}}
+    )
+    
+    emit('cloud_action_result', {'success': True, 'msg': "Zapisano w chmurze!", 'timestamp': now})
+
+@socketio.on('download_cloud_save')
+def on_download_save(data):
+    user = data.get('username', '').strip()
+    pwd = data.get('password', '').strip()
+    
+    db = get_db().database
+    users_col = db.users
+    
+    doc = users_col.find_one({"_id": user.lower()})
+    
+    if not doc or not check_password_hash(doc['password'], pwd):
+        emit('cloud_action_result', {'success': False, 'msg': "Błąd autoryzacji!"})
+        return
+        
+    save_data = doc.get('save_data')
+    if not save_data:
+        emit('cloud_action_result', {'success': False, 'msg': "Brak zapisu na koncie!"})
+    else:
+        emit('cloud_download_data', {'save_data': save_data})
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
