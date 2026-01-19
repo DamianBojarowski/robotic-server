@@ -434,7 +434,6 @@ def on_login(data):
         'action': 'login'
     })
 
-# --- 1. MODYFIKACJA UPLOADU (Żeby dało się sortować ranking) ---
 @socketio.on('upload_cloud_save')
 def on_upload_save(data):
     user = data.get('username', '').strip()
@@ -450,8 +449,9 @@ def on_upload_save(data):
         emit('cloud_action_result', {'success': False, 'msg': "Błąd autoryzacji!"})
         return
         
-    # Wyciągamy statystyki do rankingu (Lifetime Chips)
-    lc = save_json.get('lc', 0) # lc to lifetime_chips w wersji v2
+    # --- ZMIANA: Wyciągamy MPS zamiast Czipów ---
+    # Jeśli w zapisie nie ma MPS (stary zapis), dajemy 0
+    mps_score = save_json.get('mps', 0) 
     
     now = time.time()
     users_col.update_one(
@@ -460,12 +460,12 @@ def on_upload_save(data):
             "$set": {
                 "save_data": save_json, 
                 "save_date": now,
-                "ranking_score": lc # Zapisujemy osobno do sortowania
+                "ranking_score": mps_score # Zapisujemy MPS jako wynik do sortowania
             }
         }
     )
     
-    emit('cloud_action_result', {'success': True, 'msg': "Zapisano w chmurze!", 'timestamp': now})
+    emit('cloud_action_result', {'success': True, 'msg': "Zapisano! Ranking zaktualizowany.", 'timestamp': now})
 
 # --- 2. NOWE FUNKCJE SPOŁECZNOŚCIOWE ---
 
@@ -513,24 +513,21 @@ def on_get_leaderboard(data):
     ranking_data = []
     
     if mode == 'global':
-        # Pobierz TOP 50 po lifetime chips
+        # Pobierz TOP 50 sortując po ranking_score (którym teraz jest MPS)
         cursor = users_col.find({}, {"display_name": 1, "ranking_score": 1}).sort("ranking_score", -1).limit(50)
         for doc in cursor:
             ranking_data.append({
                 "name": doc.get('display_name', 'Nieznany'),
-                "score": doc.get('ranking_score', 0)
+                "mps": doc.get('ranking_score', 0),   # Wysyłamy jako MPS
+                "score": doc.get('ranking_score', 0)  # I jako score dla kompatybilności
             })
             
     elif mode == 'friends':
-        # Pobierz listę znajomych użytkownika
         me_doc = users_col.find_one({"_id": user})
         if me_doc:
             friends_list = me_doc.get('friends', [])
-            # Dodaj też siebie do rankingu znajomych
             friends_list.append(me_doc['display_name'])
             
-            # Pobierz dane dla wszystkich z listy (case insensitive search)
-            # Tworzymy listę ID (lowercase) do zapytania
             friends_ids = [f.lower() for f in friends_list]
             
             cursor = users_col.find(
@@ -541,6 +538,7 @@ def on_get_leaderboard(data):
             for doc in cursor:
                 ranking_data.append({
                     "name": doc.get('display_name', 'Nieznany'),
+                    "mps": doc.get('ranking_score', 0),
                     "score": doc.get('ranking_score', 0)
                 })
 
