@@ -52,8 +52,7 @@ def player_rejoin(room: str, user_key: str, display_name: str) -> bool:
                 f"players.{user_key}.online": True,
                 f"players.{user_key}.display_name": display_name,
                 "last_active": time.time()
-            },
-            "$inc": {"player_count": 1}
+            }
         }
     )
     return res.modified_count > 0
@@ -68,8 +67,7 @@ def player_leave(room: str, user_key: str):
             "$set": {
                 f"players.{user_key}.online": False,
                 "last_active": time.time()
-            },
-            "$inc": {"player_count": -1}
+            }
         }
     )
 
@@ -354,7 +352,18 @@ def on_leave(data):
         del active_sockets[request.sid]
     leave_room(room)
 
-    player_leave(room, user_key)
+	# --- NOWA LOGIKA USUWANIA ---
+    # Fizycznie usuwamy gracza z bazy i zmniejszamy licznik
+    col = get_db()
+    col.update_one(
+        {"_id": room},
+        {
+            "$unset": {f"players.{user_key}": ""}, # Usuwa wpis gracza
+            "$inc": {"player_count": -1}        # Zwalnia miejsce
+        }
+    )
+    # ----------------------------
+
     emit('player_left', {'username': user}, to=room)
     socketio.emit('rooms_list_update', get_public_rooms_list())
     
